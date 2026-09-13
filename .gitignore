@@ -1,0 +1,14 @@
+# Environment
+.env
+
+# Dependencies
+node_modules/
+
+# Builds
+dist/
+
+# Test coverage
+coverage/
+
+# Logs
+*.log
