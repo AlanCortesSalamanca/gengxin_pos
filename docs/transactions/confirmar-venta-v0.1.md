@@ -49,7 +49,34 @@ La operación requiere, como mínimo:
 - Validar que `terminals.id = terminal_id` exista, esté `ACTIVE` y pertenezca a la misma `branch_id`.
 - Validar que `users.id = user_id` exista y esté `ACTIVE`.
 - Validar que el usuario pueda operar la sucursal mediante `user_branches(user_id, branch_id)`.
-- Validar permiso funcional de confirmar venta mediante roles/permisos. El código exacto de permiso queda pendiente de catálogo, pero la transacción debe exigirlo antes de escribir.
+- Validar que el usuario posea el permiso funcional `SALES_CONFIRM` mediante roles/permisos.
+
+### Autorización
+
+El permiso definitivo para confirmar venta en el MVP es `SALES_CONFIRM`.
+
+La convención conceptual de permisos es `<MODULE>_<ACTION>`. Ejemplos futuros, no creados en este paso: `SALES_VIEW`, `SALES_DISCOUNT`, `RETURNS_CONFIRM`, `CASH_OPEN`, `CASH_CLOSE`, `INVENTORY_ADJUST`.
+
+La autorización usa el modelo existente: `users`, `user_roles`, `roles`, `role_permissions`, `permissions` y `user_branches`.
+
+Un usuario puede confirmar venta solamente si se cumplen todas estas condiciones:
+
+- `users.status = 'ACTIVE'`;
+- existe `user_branches(user_id, branch_id)`;
+- posee al menos un `roles.active = TRUE` del `business_id` correspondiente;
+- ese rol tiene asociado un permiso con `permissions.code = 'SALES_CONFIRM'`.
+
+La relación conceptual es `user -> user_roles -> roles -> role_permissions -> permissions` y, adicionalmente, `user -> user_branches -> branch`.
+
+No se debe autorizar por nombre de rol, por ejemplo `CASHIER`, `ADMIN` o `MANAGER`. Los roles agrupan permisos; la decisión autoritativa depende de `permissions.code = 'SALES_CONFIRM'`.
+
+No hay bypass especial de administrador. Incluso un rol administrador debe tener `SALES_CONFIRM` asignado mediante `role_permissions` si debe confirmar ventas.
+
+`SALES_CONFIRM` por sí solo no permite operar cualquier sucursal. Se requieren ambas condiciones: permiso funcional y acceso explícito a la sucursal. Si tiene `SALES_CONFIRM` pero no pertenece a la sucursal, devolver `USER_BRANCH_FORBIDDEN`. Si pertenece a la sucursal pero no tiene `SALES_CONFIRM`, devolver `USER_PERMISSION_DENIED`.
+
+Esta validación debe ejecutarse antes de cualquier escritura operativa: reservar folio, insertar `sales`, descontar inventario, registrar pagos, generar `cash_movements` o generar reposición. Puede ocurrir después de resolver idempotencia y adquirir la barrera de `client_operation_id`.
+
+No se insertan registros en `permissions`, no se crean seeds y no se modifica el schema en este diseño. La carga inicial de roles y permisos se definirá en el bootstrap/seed de la aplicación.
 
 ### Caja
 
@@ -419,8 +446,8 @@ Códigos propuestos:
 - `TERMINAL_BRANCH_MISMATCH`
 - `BRANCH_INACTIVE`
 - `USER_INACTIVE`
-- `USER_BRANCH_FORBIDDEN`
-- `USER_PERMISSION_DENIED`
+- `USER_BRANCH_FORBIDDEN`: el usuario no tiene acceso a la sucursal mediante `user_branches(user_id, branch_id)`.
+- `USER_PERMISSION_DENIED`: el usuario pertenece a la sucursal, pero no posee `permissions.code = 'SALES_CONFIRM'` mediante roles activos.
 - `CASH_SESSION_REQUIRED`
 - `CASH_SESSION_CLOSED`
 - `CASH_SESSION_TERMINAL_MISMATCH`
@@ -484,7 +511,6 @@ Resultado esperado: folios distintos sin colisión.
 
 ## 18. Decisiones pendientes
 
-- Definir código exacto de permiso para confirmar venta.
 - Definir timeout y política de espera para `SALE_IDEMPOTENCY_IN_PROGRESS`.
 - Definir si errores de dominio se persisten como `FAILED` en `idempotency_keys` o si solo se cachean operaciones completadas.
 - Definir retención de `idempotency_keys.expires_at` y tamaño permitido de `response_body`.
