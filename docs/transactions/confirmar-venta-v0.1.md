@@ -176,20 +176,25 @@ Se usan dos defensas complementarias:
 - `sales.client_operation_id` con `UNIQUE(branch_id, client_operation_id)` es una defensa secundaria de deduplicación local incluso si cambia la clave idempotente.
 - Un transaction advisory lock determinista por `(branch_id, client_operation_id)` cierra la ventana en la que todavía no existe fila en `sales`.
 
-### Adquisición de clave
+### FASE A - Reserva idempotente
 
-Al iniciar la operación se intenta adquirir `idempotency_keys` con:
+La reserva idempotente ocurre antes del `BEGIN` de la transacción operativa principal. Es una transacción corta dedicada exclusivamente a `idempotency_keys`.
 
-- `business_id`.
-- `branch_id`.
-- `operation_type = 'CONFIRM_SALE'`.
-- `idempotency_key`.
-- `request_hash`.
-- `status = 'IN_PROGRESS'`.
-- `locked_until` corto para recuperación de procesos caídos.
-- `expires_at` según política de retención.
+Flujo conceptual:
 
-La fila debe bloquearse con semántica equivalente a `SELECT ... FOR UPDATE` sobre la clave única `(business_id, operation_type, idempotency_key)`.
+### BEGIN
+
+1. Buscar o adquirir la clave única `(business_id, operation_type='CONFIRM_SALE', idempotency_key)`.
+2. Si no existe, crearla con `status='IN_PROGRESS'`, `request_hash` canónico, `locked_until = now() + 30 segundos` y `expires_at` según la política de retención.
+3. Si existe, resolver su estado según las reglas `IN_PROGRESS`, `COMPLETED` o `FAILED` descritas abajo.
+
+### COMMIT
+
+Esta fase no contiene escrituras de negocio: no crea `sales`, `sale_items`, inventario, pagos, caja, folios, reposición, cotización ni `audit_log`.
+
+La constraint única `(business_id, operation_type, idempotency_key)` sigue siendo la última defensa. La implementación futura puede usar semántica equivalente a `INSERT ... ON CONFLICT` seguida de lectura y bloqueo de la fila, sin definir SQL definitivo en este documento.
+
+Separar esta reserva evita que un `ROLLBACK` de venta elimine también la fila `IN_PROGRESS`. Así `locked_until` funciona como lease persistente para detectar y recuperar procesos interrumpidos.
 
 ### Barrera por `client_operation_id`
 
@@ -209,9 +214,15 @@ Si ya existe una venta con el mismo `client_operation_id` pero otra `idempotency
 
 ### Si la clave está `IN_PROGRESS`
 
-- Si otra transacción mantiene el lock, devolver `SALE_IDEMPOTENCY_IN_PROGRESS` o esperar con timeout corto configurado.
-- Si `locked_until` expiró, puede recuperarse la clave solo si no hay `result_entity_id` y el `request_hash` coincide.
+- Para `CONFIRM_SALE` en MVP, `locked_until = now() + 30 segundos`.
+- Si `locked_until > now()`, devolver `SALE_IDEMPOTENCY_IN_PROGRESS`.
+- No mantener una petición HTTP esperando 30 segundos; el POS podrá reintentar posteriormente.
+- Si otra transacción todavía bloquea la fila, considerarla todavía `IN_PROGRESS`.
+- Si `locked_until <= now()`, puede recuperarse únicamente si `request_hash` coincide, `result_entity_id IS NULL`, no existe ya una venta correspondiente a la operación y la fila puede adquirirse sin competir con una transacción activa.
+- Al recuperar, actualizar `locked_until = now() + 30 segundos` y continuar.
 - Si el `request_hash` no coincide, devolver `SALE_IDEMPOTENCY_KEY_REUSED`.
+
+La expiración de `locked_until` no significa que deba ejecutarse otra venta mientras una transacción original continúa activa. La implementación futura deberá usar locking de PostgreSQL para que solamente una ejecución posea efectivamente la fila.
 
 ### Si la clave está `COMPLETED`
 
@@ -222,12 +233,74 @@ Si ya existe una venta con el mismo `client_operation_id` pero otra `idempotency
 ### Si la clave está `FAILED`
 
 - Si el `request_hash` no coincide, devolver `SALE_IDEMPOTENCY_KEY_REUSED`.
-- Si el fallo fue de dominio determinístico, devolver el mismo error almacenado.
-- Si el fallo fue técnico recuperable y no existe `result_entity_id`, se puede permitir reintento cambiando la fila a `IN_PROGRESS` con nuevo `locked_until`; esta política requiere revisión antes de implementación.
+- Si el `request_hash` coincide, devolver el mismo error de dominio almacenado.
+- No reintentar automáticamente la operación.
+- Si el usuario corrige algo y desea intentar otra vez, el POS debe generar una nueva `idempotency_key`.
 
-### Relación con rollback
+### FASE B - CONFIRMAR VENTA transaccional
 
-Si la fila `IN_PROGRESS` se crea dentro de la misma transacción y luego ocurre `ROLLBACK`, esa fila también desaparece. Esto evita basura transaccional, pero no persiste el error. Para errores de dominio que se quiera cachear como `FAILED`, debe manejarse una ruta controlada: terminar sin escrituras operativas, actualizar `idempotency_keys.status = 'FAILED'` con `error_code/error_message`, y hacer `COMMIT` solo de la clave. Esta decisión debe implementarse deliberadamente, no como efecto accidental de excepciones SQL.
+Después de reservar correctamente la clave, inicia la transacción operativa.
+
+Al inicio de FASE B:
+
+1. Bloquear la fila `idempotency_keys` correspondiente.
+2. Comprobar nuevamente `status`, `request_hash` y lease/propiedad de la ejecución.
+3. Continuar con advisory lock de `client_operation_id`, autorización, caja, cotización, catálogos, inventario, reposición, folio, venta, pagos, caja, auditoría y efectos operativos.
+
+Al final de la misma transacción operativa, actualizar `idempotency_keys`:
+
+- `status = 'COMPLETED'`;
+- `result_entity_type = 'sales'`;
+- `result_entity_id = sales.id`;
+- `response_body = respuesta mínima`;
+- `error_code = NULL`;
+- `error_message = NULL`;
+- `locked_until = NULL`;
+- `expires_at = now() + 30 días`.
+
+La venta confirmada y `idempotency_keys.status='COMPLETED'` son atómicos. Nunca debe existir una venta `COMMITTED` cuyo cambio a `COMPLETED` haya quedado fuera de esa misma transacción operativa.
+
+### FASE C - Persistencia de FAILED
+
+Persistir `FAILED` solamente para errores de dominio determinísticos, por ejemplo: `USER_BRANCH_FORBIDDEN`, `USER_PERMISSION_DENIED`, `CASH_SESSION_CLOSED`, `PRODUCT_INACTIVE`, `PRICE_CHANGED`, `INVALID_DISCOUNT`, `INSUFFICIENT_STOCK`, `PAYMENT_TOTAL_MISMATCH`, `QUOTATION_EXPIRED` o `QUOTATION_ALREADY_CONVERTED`.
+
+Si la FASE B ya inició y ocurre un error de dominio determinístico:
+
+1. Hacer `ROLLBACK` completo de la transacción operativa.
+2. Abrir una transacción corta separada.
+3. Bloquear `idempotency_keys`.
+4. Verificar que `request_hash` siga correspondiendo.
+5. Actualizar `status='FAILED'`, `error_code`, `error_message` seguro y breve, `locked_until=NULL`, `expires_at=now() + 30 días`.
+6. Hacer `COMMIT`.
+
+FASE C no contiene escrituras de negocio. No debe persistir stack traces, SQL interno, credenciales, tokens, datos sensibles ni detalles técnicos internos.
+
+### Fallos técnicos
+
+Para fallos técnicos no determinísticos, como pérdida de conexión, caída del proceso, timeout interno o error inesperado antes de conocer el resultado, no marcar automáticamente `FAILED`.
+
+La clave puede permanecer `IN_PROGRESS` hasta que expire `locked_until`. Después se aplica la recuperación segura descrita para `IN_PROGRESS` expirado. Antes de reejecutar, debe comprobarse si `sales(branch_id, client_operation_id)` ya existe. Si existe, la operación no debe repetirse; debe reconciliarse la `idempotency_key` con la venta existente actualizando la clave hacia `COMPLETED` con `result_entity_type='sales'`, `result_entity_id` y una `response_body` mínima, dentro de una transacción controlada.
+
+### Retención y `response_body`
+
+Para MVP:
+
+- `COMPLETED`: retener 30 días después de completar.
+- `FAILED`: retener 30 días después de fallar.
+- `IN_PROGRESS`: `locked_until` controla exclusividad operativa; `expires_at` no debe usarse como mecanismo de locking.
+
+Una tarea de limpieza futura podrá eliminar registros con `expires_at < now()`, siempre que no estén asociados a una operación todavía activa. No se crea esa tarea en este diseño.
+
+`response_body` debe ser deliberadamente pequeño, con límite lógico de aplicación de 16 KiB. Debe contener solo una respuesta mínima útil para replay, por ejemplo:
+
+- `sale_public_id`;
+- `folio`;
+- `status`;
+- `total`;
+- `currency`;
+- `confirmed_at`.
+
+No guardar en `response_body`: ticket completo, imágenes, XML, PDF, objetos enormes, secretos ni información innecesaria. Si la respuesta completa supera el límite, guardar solo información mínima y reconstruir el resto desde `result_entity_id`.
 
 ## 5. Orden definitivo de locks
 
@@ -247,12 +320,26 @@ Nota crítica: el folio se bloquea después de revalidar inventario para no mant
 
 ## 6. Orden transaccional propuesto
 
+### FASE A - Reserva idempotente
+
 ### BEGIN
 
-1. Adquirir o resolver idempotencia.
-2. Si la operación ya está `COMPLETED`, devolver la venta existente sin crear nada.
+1. Resolver o reservar `idempotency_key`.
+2. Si está `COMPLETED`, devolver la venta existente sin entrar a FASE B.
+3. Si está `FAILED` con mismo `request_hash`, devolver el error de dominio almacenado sin entrar a FASE B.
+4. Si está `IN_PROGRESS` vigente, devolver `SALE_IDEMPOTENCY_IN_PROGRESS`.
+5. Si no existe o es `IN_PROGRESS` recuperable, dejar la fila en `IN_PROGRESS` con `locked_until = now() + 30 segundos`.
+
+### COMMIT
+
+### FASE B - CONFIRMAR VENTA transaccional
+
+### BEGIN
+
+1. Bloquear y verificar la fila `idempotency_keys` reservada.
+2. Comprobar nuevamente `status`, `request_hash` y lease/propiedad de la ejecución.
 3. Adquirir advisory lock determinista por `(branch_id, client_operation_id)`.
-4. Verificar venta previa por `sales(branch_id, client_operation_id)`; si existe, devolverla.
+4. Verificar venta previa por `sales(branch_id, client_operation_id)`; si existe, reconciliar idempotencia hacia `COMPLETED` y devolverla.
 5. Validar `branch`, `terminal`, `user`, permisos y pertenencia a sucursal.
 6. Bloquear y validar `cash_session` abierta de la misma sucursal y terminal.
 7. Bloquear y validar cotización si aplica.
@@ -276,15 +363,26 @@ Nota crítica: el folio se bloquea después de revalidar inventario para no mant
 25. Insertar un `replenishment_movements` por cada `sale_item`, con `reference_entity_type='sale_items'` y `reference_entity_id=sale_items.id`.
 26. Convertir cotización si aplica: actualizar `quotations.status='CONVERTED'` y `converted_sale_id=sale.id`.
 27. Insertar `audit_log` de venta confirmada.
-28. Marcar `idempotency_keys.status='COMPLETED'`, `result_entity_type='sales'`, `result_entity_id=sale.id` y `response_body` mínima.
+28. Marcar `idempotency_keys.status='COMPLETED'`, `result_entity_type='sales'`, `result_entity_id=sale.id`, `response_body` mínima, `error_code=NULL`, `error_message=NULL`, `locked_until=NULL` y `expires_at=now()+30 días`.
 
 ### COMMIT
+
+### FASE C - Fallo de dominio determinístico
+
+Solo si FASE B falla por error de dominio determinístico:
+
+1. `ROLLBACK` completo de FASE B.
+2. `BEGIN` corto sin escrituras de negocio.
+3. Bloquear `idempotency_keys`.
+4. Verificar `request_hash`.
+5. Actualizar `status='FAILED'`, `error_code`, `error_message`, `locked_until=NULL`, `expires_at=now()+30 días`.
+6. `COMMIT`.
 
 ## 7. Escrituras definitivas
 
 La transacción crea o actualiza:
 
-- `idempotency_keys`: `IN_PROGRESS` al inicio y `COMPLETED` al final si confirma.
+- `idempotency_keys`: `IN_PROGRESS` en FASE A; `COMPLETED` al final de FASE B si confirma; `FAILED` en FASE C solo para errores de dominio determinísticos.
 - `document_sequences`: incremento de `next_number` para `VEN`.
 - `sales`: cabecera confirmada.
 - `sale_items`: líneas con snapshots y costo unitario snapshot.
@@ -428,19 +526,19 @@ Si falla cualquier paso antes de `COMMIT`, PostgreSQL revierte:
 - conversión de cotización;
 - incremento de `document_sequences.next_number`;
 - evento de `audit_log`;
-- cambio final de `idempotency_keys`.
+- cambio final de `idempotency_keys` a `COMPLETED`.
 
 No queda venta parcial, inventario descontado, movimiento de caja aislado, demanda de reposición aislada, cotización convertida sin venta ni folio confirmado de forma inconsistente.
 
-Consideración de idempotencia: si la clave se crea en la misma transacción y todo hace `ROLLBACK`, la clave desaparece. Esto permite retry limpio, pero no conserva el motivo del fallo. Persistir errores `FAILED` exige una ruta controlada separada que no haga escrituras operativas.
+Consideración de idempotencia: FASE A persiste `IN_PROGRESS` antes de FASE B, por lo que un `ROLLBACK` operativo no elimina el lease. Si FASE B falla por dominio determinístico, FASE C registra `FAILED` en una transacción corta sin escrituras de negocio. Si FASE B falla técnicamente sin resultado conocido, no se marca automáticamente `FAILED`; la recuperación dependerá de `locked_until` y de reconciliar contra `sales(branch_id, client_operation_id)`.
 
 ## 16. Errores de dominio
 
 Códigos propuestos:
 
-- `SALE_IDEMPOTENCY_IN_PROGRESS`
-- `SALE_IDEMPOTENCY_KEY_REUSED`
-- `SALE_IDEMPOTENCY_FAILED`
+- `SALE_IDEMPOTENCY_IN_PROGRESS`: existe una ejecución válida todavía activa.
+- `SALE_IDEMPOTENCY_KEY_REUSED`: la misma key fue usada con `request_hash` diferente.
+- `SALE_IDEMPOTENCY_FAILED`: categoría interna si es necesaria; para un `FAILED` determinístico se debe preferir devolver el error de dominio original almacenado.
 - `SALE_ALREADY_CONFIRMED`
 - `TERMINAL_INACTIVE`
 - `TERMINAL_BRANCH_MISMATCH`
@@ -511,7 +609,4 @@ Resultado esperado: folios distintos sin colisión.
 
 ## 18. Decisiones pendientes
 
-- Definir timeout y política de espera para `SALE_IDEMPOTENCY_IN_PROGRESS`.
-- Definir si errores de dominio se persisten como `FAILED` en `idempotency_keys` o si solo se cachean operaciones completadas.
-- Definir retención de `idempotency_keys.expires_at` y tamaño permitido de `response_body`.
 - Definir si se persistirá un fingerprint adicional para detectar reutilización de `client_operation_id` con payload distinto.
