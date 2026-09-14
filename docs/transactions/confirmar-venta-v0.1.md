@@ -80,8 +80,48 @@ La operación requiere, como mínimo:
 - Validar que cada `payment_method_id` exista, esté activo y pertenezca al `business_id`.
 - Resolver `replenishment_channel` desde `payment_methods.replenishment_channel`.
 - En MVP, impedir mezcla de canales `CASH` y `TRANSFER` dentro de la misma venta.
-- Validar que la suma de `sale_payments.amount` sea exactamente igual al total de la venta según regla de redondeo definida.
+- Validar que `SUM(sale_payments.amount) = sales.total` con comparación decimal exacta.
 - Registrar todos los pagos en `sale_payments`, aunque no todos afecten caja física.
+
+### Política monetaria y redondeo
+
+Para el MVP, la moneda operativa del POS es `MXN`.
+
+Los importes monetarios finales se almacenan como `NUMERIC(18,2)`. Los cálculos monetarios autoritativos no deben usar `FLOAT`, `DOUBLE` ni tipos binarios equivalentes como `number` flotante. El backend futuro deberá usar aritmética decimal exacta y comportarse de forma consistente con PostgreSQL `NUMERIC`.
+
+Se mantienen las precisiones del modelo físico:
+
+- dinero: `NUMERIC(18,2)`;
+- cantidades: `NUMERIC(18,4)`;
+- costos y factores: `NUMERIC(18,6)`.
+
+Las cantidades y factores pueden tener más precisión que el importe monetario final.
+
+El cálculo conceptual de línea es:
+
+- `importe_bruto_linea = quantity * unit_price`;
+- el cálculo intermedio conserva precisión decimal suficiente;
+- `subtotal_linea` se redondea a 2 decimales;
+- los descuentos monetarios finales de línea se expresan a 2 decimales;
+- los impuestos pueden calcularse internamente con mayor precisión cuando sea necesario;
+- `tax_total` de línea y `total` de línea terminan almacenados a 2 decimales.
+
+Para importes operativos del POS se usa redondeo decimal estándar: `ROUND(valor, 2)`. No se permite truncamiento silencioso ni tolerancias tipo `ABS(a - b) < 0.01` para decidir igualdad entre montos monetarios almacenados.
+
+El servidor futuro será la autoridad de cálculo. El POS puede enviar montos esperados para UX o validación, pero no es la autoridad definitiva. Los totales del documento se calculan y almacenan a 2 decimales:
+
+- `subtotal = SUM(subtotal de líneas)`;
+- `discount_total = SUM(descuentos finales)`;
+- `tax_total = SUM(impuestos finales)`;
+- `total = resultado monetario final del documento`.
+
+Cada `sale_payments.amount` debe tener como máximo 2 decimales y ser mayor a cero. La regla definitiva para confirmar venta es `SUM(sale_payments.amount) = sales.total` con comparación decimal exacta. Si no coincide, devolver `PAYMENT_TOTAL_MISMATCH`.
+
+Para el MVP no se permite sobrepago, pago incompleto ni generación automática de cambio como parte de una diferencia matemática. Si posteriormente se desea manejar un caso como "recibí $500 y devuelve $73.50", deberá modelarse como monto recibido/cambio en la capa POS correspondiente, sin alterar que `sale_payments.amount` representa exactamente el monto aplicado a la venta.
+
+Las cotizaciones siguen la misma regla monetaria. Cuando una cotización vigente se convierte en venta, se conservan sus snapshots monetarios permitidos y el total final de pagos debe coincidir exactamente con el total de la venta resultante.
+
+Estas reglas definen los totales operativos del POS. La generación CFDI puede requerir precisión fiscal adicional en bases, tasas, impuestos e importes de concepto según reglas SAT vigentes. Los cálculos fiscales detallados se definirán al diseñar el flujo CFDI; no se cambia el modelo fiscal en esta transacción.
 
 ### Stock
 
@@ -192,7 +232,7 @@ Nota crítica: el folio se bloquea después de revalidar inventario para no mant
 8. Resolver y validar cliente, lista de precios, productos, unidades, precios, descuentos e impuestos.
 9. Resolver métodos de pago y `replenishment_channel`.
 10. Rechazar mezcla de canales `CASH` / `TRANSFER` para MVP.
-11. Validar total de pagos contra total de venta.
+11. Validar `SUM(sale_payments.amount) = sales.total` con comparación decimal exacta.
 12. Agregar cantidades por `product_id` para evitar doble descuento si el producto aparece en varias líneas.
 13. Bloquear `inventory_balances` por `branch_id` y productos agregados, en orden `product_id`.
 14. Revalidar stock suficiente y capturar `average_cost_base` como costo de salida.
@@ -398,7 +438,7 @@ Códigos propuestos:
 - `INVALID_TAX_CALCULATION`
 - `INSUFFICIENT_STOCK`
 - `PAYMENT_METHOD_INACTIVE`
-- `PAYMENT_TOTAL_MISMATCH`
+- `PAYMENT_TOTAL_MISMATCH`: `SUM(sale_payments.amount) <> sales.total` con comparación decimal exacta.
 - `MIXED_REPLENISHMENT_CHANNELS`
 - `DOCUMENT_SEQUENCE_NOT_FOUND`
 - `DOCUMENT_SEQUENCE_INACTIVE`
@@ -445,7 +485,6 @@ Resultado esperado: folios distintos sin colisión.
 ## 18. Decisiones pendientes
 
 - Definir código exacto de permiso para confirmar venta.
-- Definir regla de redondeo para comparar pagos contra total.
 - Definir timeout y política de espera para `SALE_IDEMPOTENCY_IN_PROGRESS`.
 - Definir si errores de dominio se persisten como `FAILED` en `idempotency_keys` o si solo se cachean operaciones completadas.
 - Definir retención de `idempotency_keys.expires_at` y tamaño permitido de `response_body`.
