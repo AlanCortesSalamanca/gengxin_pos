@@ -172,9 +172,39 @@ Estas reglas definen los totales operativos del POS. La generación CFDI puede r
 
 Se usan dos defensas complementarias:
 
-- `idempotency_keys` es la defensa primaria: evita duplicados por retry HTTP, doble clic o pérdida de respuesta, y permite validar `request_hash`.
-- `sales.client_operation_id` con `UNIQUE(branch_id, client_operation_id)` es una defensa secundaria de deduplicación local incluso si cambia la clave idempotente.
+- `idempotency_keys` + `request_hash` es la defensa primaria de idempotencia y validación del payload.
+- `sales.client_operation_id` con `UNIQUE(branch_id, client_operation_id)` es una defensa secundaria de identidad y deduplicación de una venta lógica dentro de una sucursal.
 - Un transaction advisory lock determinista por `(branch_id, client_operation_id)` cierra la ventana en la que todavía no existe fila en `sales`.
+
+`idempotency_key` y `client_operation_id` no tienen exactamente la misma responsabilidad. La primera protege reintentos de una solicitud concreta y detecta payload distinto mediante `request_hash`. La segunda identifica la venta lógica creada por el POS.
+
+### Contrato de `client_operation_id`
+
+`client_operation_id` identifica una única venta lógica dentro de una sucursal. Debe ser:
+
+- generado por el POS;
+- opaco para el servidor;
+- estable durante los retries de esa misma venta lógica;
+- distinto para una nueva venta lógica.
+
+La base protege `UNIQUE(branch_id, client_operation_id)`, por lo que un `client_operation_id` confirmado queda consumido permanentemente para esa sucursal.
+
+Si una operación falla antes de crear una venta, por ejemplo por `PRICE_CHANGED`, `INSUFFICIENT_STOCK`, `PAYMENT_TOTAL_MISMATCH` u otro error de dominio, y el usuario corrige la misma venta lógica, puede mantenerse el mismo `client_operation_id`. En ese caso debe utilizarse una nueva `idempotency_key` y un nuevo `request_hash` correspondiente al payload corregido. Esto es válido porque todavía no existe una fila `sales` asociada a ese `client_operation_id`.
+
+Una vez que existe `sales(branch_id, client_operation_id)`, ese `client_operation_id` no puede crear otra venta. Si llega otro request con el mismo `branch_id` y `client_operation_id`, aunque use otra `idempotency_key`, no se crea otra venta. La venta existente es la autoridad para esa identidad lógica.
+
+Para el MVP no se persistirá un fingerprint adicional en `sales`. No se agregan `request_fingerprint`, `payload_hash` ni `confirmation_hash`. Si alguien reutiliza accidentalmente un `client_operation_id` confirmado con otra `idempotency_key` y otro payload, el servidor no intentará inferir una segunda venta: la identidad existente prevalece y se devuelve la venta ya confirmada. Reutilizar un `client_operation_id` confirmado para una nueva venta es un error del cliente POS; la defensa segura del servidor consiste en no crear jamás una segunda venta. Un fingerprint futuro sería una posible mejora fuera del MVP, no una decisión pendiente de `CONFIRMAR VENTA v0.1`.
+
+La regla de `idempotency_key` no cambia: si se reutiliza la misma `idempotency_key` con `request_hash` diferente, se devuelve `SALE_IDEMPOTENCY_KEY_REUSED`.
+
+Regla conceptual para la futura aplicación POS:
+
+- Venta A usa `client_operation_id = X`.
+- Retries de Venta A mantienen `X`.
+- Venta A falla antes de confirmar y el cajero corrige el carrito: puede mantener `X`, pero usa nueva `idempotency_key` y nuevo `request_hash`.
+- Venta A confirma: `X` queda consumido.
+- Venta B debe generar `client_operation_id = Y`.
+- Nunca reutilizar `X` para Venta B.
 
 ### FASE A - Reserva idempotente
 
@@ -185,7 +215,7 @@ Flujo conceptual:
 ### BEGIN
 
 1. Buscar o adquirir la clave única `(business_id, operation_type='CONFIRM_SALE', idempotency_key)`.
-2. Si no existe, crearla con `status='IN_PROGRESS'`, `request_hash` canónico, `locked_until = now() + 30 segundos` y `expires_at` según la política de retención.
+2. Si no existe, crearla con `status='IN_PROGRESS'`, `request_hash` canónico, `locked_until = now() + 30 segundos` y `expires_at = NULL`.
 3. Si existe, resolver su estado según las reglas `IN_PROGRESS`, `COMPLETED` o `FAILED` descritas abajo.
 
 ### COMMIT
@@ -210,7 +240,7 @@ El flujo es:
 
 El advisory lock se libera automáticamente al `COMMIT` o `ROLLBACK`. La constraint `UNIQUE(branch_id, client_operation_id)` sigue siendo la última defensa en PostgreSQL.
 
-Si ya existe una venta con el mismo `client_operation_id` pero otra `idempotency_key`, se devuelve la venta existente. Si en el futuro se quiere detectar reutilización de `client_operation_id` con payload distinto, será necesario persistir un fingerprint específico o adoptar otra política explícita.
+Si ya existe una venta con el mismo `client_operation_id` pero otra `idempotency_key`, se devuelve la venta existente. Si en el futuro, fuera del MVP, se quiere detectar reutilización de `client_operation_id` con payload distinto, será necesario persistir un fingerprint específico o adoptar otra política explícita.
 
 ### Si la clave está `IN_PROGRESS`
 
@@ -291,6 +321,8 @@ Para MVP:
 
 Una tarea de limpieza futura podrá eliminar registros con `expires_at < now()`, siempre que no estén asociados a una operación todavía activa. No se crea esa tarea en este diseño.
 
+Mientras una `idempotency_key` está `IN_PROGRESS`, `expires_at` puede permanecer `NULL`; `locked_until` es el mecanismo de lease. Al pasar a `COMPLETED` o `FAILED`, establecer `expires_at = now() + 30 días`. Esto no requiere cambios de schema porque `expires_at` ya admite `NULL`.
+
 `response_body` debe ser deliberadamente pequeño, con límite lógico de aplicación de 16 KiB. Debe contener solo una respuesta mínima útil para replay, por ejemplo:
 
 - `sale_public_id`;
@@ -339,7 +371,7 @@ Nota crítica: el folio se bloquea después de revalidar inventario para no mant
 1. Bloquear y verificar la fila `idempotency_keys` reservada.
 2. Comprobar nuevamente `status`, `request_hash` y lease/propiedad de la ejecución.
 3. Adquirir advisory lock determinista por `(branch_id, client_operation_id)`.
-4. Verificar venta previa por `sales(branch_id, client_operation_id)`; si existe, reconciliar idempotencia hacia `COMPLETED` y devolverla.
+4. Verificar venta previa por `sales(branch_id, client_operation_id)`; si existe, no ejecutar efectos de negocio nuevamente, reconciliar idempotencia hacia `COMPLETED` y devolver la venta existente.
 5. Validar `branch`, `terminal`, `user`, permisos y pertenencia a sucursal.
 6. Bloquear y validar `cash_session` abierta de la misma sucursal y terminal.
 7. Bloquear y validar cotización si aplica.
@@ -377,6 +409,25 @@ Solo si FASE B falla por error de dominio determinístico:
 4. Verificar `request_hash`.
 5. Actualizar `status='FAILED'`, `error_code`, `error_message`, `locked_until=NULL`, `expires_at=now()+30 días`.
 6. `COMMIT`.
+
+### Reconciliación por venta existente
+
+Si FASE B encuentra una venta existente para `(branch_id, client_operation_id)`:
+
+1. No ejecutar nuevamente efectos de negocio.
+2. No descontar inventario.
+3. No reservar otro folio.
+4. No generar nuevos pagos.
+5. No generar nueva caja.
+6. No generar nueva reposición.
+7. Reconciliar la `idempotency_key` actual hacia `COMPLETED`.
+8. Asociarla con `result_entity_type='sales'` y `result_entity_id` de la venta existente.
+9. Guardar `response_body` mínima.
+10. Establecer `expires_at = now() + 30 días`.
+11. Hacer `COMMIT`.
+12. Devolver la venta existente.
+
+Puede existir más de una `idempotency_key` `COMPLETED` apuntando a la misma venta como resultado de reconciliación. Eso no significa que existan ventas duplicadas.
 
 ## 7. Escrituras definitivas
 
@@ -539,7 +590,7 @@ Códigos propuestos:
 - `SALE_IDEMPOTENCY_IN_PROGRESS`: existe una ejecución válida todavía activa.
 - `SALE_IDEMPOTENCY_KEY_REUSED`: la misma key fue usada con `request_hash` diferente.
 - `SALE_IDEMPOTENCY_FAILED`: categoría interna si es necesaria; para un `FAILED` determinístico se debe preferir devolver el error de dominio original almacenado.
-- `SALE_ALREADY_CONFIRMED`
+- `SALE_ALREADY_CONFIRMED`: reservado para otros flujos futuros que intenten confirmar explícitamente una venta ya confirmada. Encontrar `sales(branch_id, client_operation_id)` durante un retry idempotente válido no debe usar este error; debe tratarse como replay/reconciliación exitosa y devolver la venta.
 - `TERMINAL_INACTIVE`
 - `TERMINAL_BRANCH_MISMATCH`
 - `BRANCH_INACTIVE`
@@ -591,7 +642,7 @@ Resultado esperado: una sola venta.
 
 ### C. Mismo `client_operation_id` enviado después de `COMMIT`
 
-La unicidad `sales(branch_id, client_operation_id)` ya contiene la venta. Devolver la venta existente aunque llegue con otra `idempotency_key`. Como `sales` no almacena `request_hash`, no se detecta payload distinto solo con esta tabla; esa validación futura requerirá persistir un fingerprint específico o definir otra política explícita.
+La unicidad `sales(branch_id, client_operation_id)` ya contiene la venta. Devolver la venta existente aunque llegue con otra `idempotency_key`. Como `sales` no almacena `request_hash`, no se detecta payload distinto solo con esta tabla. Una validación futura con fingerprint sería una mejora fuera del MVP, no una decisión pendiente de `CONFIRMAR VENTA v0.1`.
 
 Resultado esperado: devolver la venta ya creada, no crear otra.
 
@@ -609,4 +660,4 @@ Resultado esperado: folios distintos sin colisión.
 
 ## 18. Decisiones pendientes
 
-- Definir si se persistirá un fingerprint adicional para detectar reutilización de `client_operation_id` con payload distinto.
+Ninguna.
