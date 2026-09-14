@@ -6,6 +6,17 @@ Referencia física: `docs/database/modelo-fisico-v0.5-db-2.md` y `database/schem
 
 Este documento diseña conceptualmente la transacción `CONFIRMAR VENTA`. No define framework, API, DTOs, servicios, repositorios ni código.
 
+## Estado del diseño
+
+- Estado: VALIDADO / CONGELADO
+- Versión: v0.1
+- Compatible con especificación maestra v0.5
+- Compatible con modelo físico PostgreSQL v0.5-db-2
+- Decisiones pendientes: 0
+- Implementación: todavía no iniciada
+
+Cualquier cambio funcional posterior a este contrato requiere una nueva revisión/versionado del diseño transaccional.
+
 ## 1. Objetivo
 
 Confirmar una venta de forma atómica, trazable e idempotente, garantizando que:
