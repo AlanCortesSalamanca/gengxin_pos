@@ -43,7 +43,7 @@ La operacion requiere, como minimo:
 
 - `business_id` derivado de la sucursal o contexto autenticado.
 - `branch_id` objetivo de la devolucion.
-- `terminal_id` autenticada, aunque `returns` no lo almacena en db-2.
+- `terminal_id` autenticada como contexto operativo de ejecucion; no se persiste directamente en `returns` para el MVP.
 - `user_id` actor.
 - `cash_session_id` solo si el reembolso afecta caja fisica.
 - `sale_id` de la venta original.
@@ -82,7 +82,6 @@ Tablas y columnas verificadas en `database/schema-v0.5-db-2.sql`:
 
 Gaps fisicos relevantes detectados:
 
-- `returns` no tiene `terminal_id`; la terminal puede validarse y quedar en `audit_log`, pero no en la cabecera de devolucion.
 - `returns` no tiene `request_hash`; el hash vive en `idempotency_keys`.
 - `return_items` no tiene columnas separadas de subtotal, descuento, impuesto o costo; solo persiste `refund_amount` monetario por linea.
 - db-2 no modela un saldo separado de inventario danado.
@@ -93,6 +92,15 @@ Cambio fisico requerido posterior a db-2:
 - agregar unicidad conceptual `UNIQUE(branch_id, client_operation_id)`.
 
 Esta decision ya queda cerrada para el diseno transaccional, pero no se modifica db-2. db-2 permanece congelado como version validada. No se crea db-3 ni migracion en este micro-hito; la evolucion fisica se hara posteriormente, una vez cerradas las decisiones de diseno que puedan afectar schema.
+
+Decision definitiva sobre `terminal_id` para MVP:
+
+- `terminal_id` es contexto autenticado de ejecucion.
+- Se usa para validar que la terminal exista, este `ACTIVE` y pertenezca a `branch_id`.
+- Si el reembolso afecta caja, se usa para validar que `cash_sessions.terminal_id` corresponda a la terminal autenticada.
+- No se agrega `returns.terminal_id`.
+- La trazabilidad operacional del dispositivo se conserva en `audit_log.terminal_id`.
+- Cuando hay caja, la terminal tambien queda verificable indirectamente mediante la `cash_session` utilizada.
 
 No se modifica schema en este documento.
 
@@ -509,12 +517,14 @@ Cuando el reembolso afecta caja:
 - `cash_session_id` es obligatorio;
 - la sesion debe estar `OPEN`;
 - la sesion debe pertenecer a `branch_id`;
-- para MVP, la sesion debe pertenecer a `terminal_id`;
+- para MVP, `cash_sessions.terminal_id` debe corresponder a la `terminal_id` autenticada;
 - insertar `cash_movements` negativo;
 - usar referencia a `returns`;
 - usar `actor_user_id = user_id`.
 
 No se modifican los movimientos originales de la venta.
+
+Si el metodo de reembolso no afecta caja fisica, puede no existir `cash_session_id`. En ese caso, la terminal desde la que se confirmo la devolucion queda registrada en `audit_log.terminal_id`; `audit_log` es la fuente de trazabilidad operacional del dispositivo.
 
 DECISION / GAP A REVISAR: db-2 no contiene tabla `return_payments` ni permite varios metodos de reembolso en una devolucion. v0.1 asume un solo `refund_payment_method_id` por `returns`.
 
@@ -670,7 +680,7 @@ Registrar evento minimo en `audit_log`:
 
 - `actor_user_id = user_id`;
 - `branch_id`;
-- `terminal_id` cuando corresponda, aunque `returns` no lo almacene;
+- `terminal_id` de la terminal autenticada que ejecuto la confirmacion;
 - `action = 'RETURN_CONFIRMED'`;
 - `entity_type = 'returns'`;
 - `entity_id = returns.id`;
@@ -790,10 +800,11 @@ Cambio fisico requerido posterior a db-2, ya decidido:
 - agregar `returns.client_operation_id TEXT NOT NULL`;
 - agregar `UNIQUE(branch_id, client_operation_id)`.
 
+No se agrega `returns.terminal_id` al listado de cambios fisicos requeridos para el MVP. `terminal_id` queda como contexto operativo validado y auditado, no como identidad funcional de la devolucion.
+
 Gaps de diseno que siguen pendientes:
 
 - `DAMAGED`: db-2 no modela inventario danado ni movimiento fisico sin afectar saldo vendible; v0.1 propone no crear `inventory_movements` para `DAMAGED`.
-- Auditoria/terminal: `returns` no almacena `terminal_id`; queda en `audit_log` y validacion operacional.
 - Totales fiscales: `return_items` solo guarda `refund_amount`, no desglose de subtotal, descuento e impuesto devuelto.
 - Reembolsos multiples: db-2 solo permite un `refund_payment_method_id` por devolucion.
 - Borrado logico de venta: db-2 no tiene `sales.deleted_at`; la regla de venta no eliminada no tiene columna directa.
