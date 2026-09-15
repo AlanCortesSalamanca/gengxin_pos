@@ -102,6 +102,16 @@ Decision definitiva sobre `terminal_id` para MVP:
 - La trazabilidad operacional del dispositivo se conserva en `audit_log.terminal_id`.
 - Cuando hay caja, la terminal tambien queda verificable indirectamente mediante la `cash_session` utilizada.
 
+Decision definitiva sobre retencion historica de `sales` para MVP:
+
+- No se agrega `sales.deleted_at`, `sales.deleted_by`, `sales.is_deleted` ni otra columna equivalente.
+- Una venta confirmada es un documento historico y no debe eliminarse fisicamente como mecanismo normal de operacion.
+- Las correcciones posteriores se representan mediante estados, devoluciones, cancelaciones autorizadas y movimientos compensatorios o reversas cuando corresponda.
+- `CONFIRMAR DEVOLUCION` no valida `sales.deleted_at IS NULL` porque esa columna no existe y no es necesaria para el MVP.
+- La aplicacion futura no debe exponer una operacion normal de DELETE fisico para `sales` confirmadas.
+- Una necesidad excepcional de mantenimiento, migracion o correccion administrativa fuera del flujo normal queda fuera de `CONFIRMAR DEVOLUCION` y requeriria controles operacionales especificos. No se disena ese flujo aqui.
+- `sales.status = 'CANCELLED'` no elimina la venta; permanece como registro historico y auditable, pero no es retornable.
+
 No se modifica schema en este documento.
 
 ## 4. Precondiciones
@@ -111,15 +121,16 @@ No se modifica schema en este documento.
 - El usuario `user_id` existe y esta `ACTIVE`.
 - El usuario pertenece a la sucursal mediante `user_branches(user_id, branch_id)`.
 - El usuario tiene permiso funcional `RETURNS_CONFIRM` mediante `permissions.code`, roles activos y `role_permissions`.
-- La venta `sale_id` existe, pertenece a la misma `branch_id` para el MVP, pertenece al mismo `business_id` via sucursal y no esta eliminada.
-- La venta original esta en estado compatible para devolucion. En db-2 los estados disponibles son `CONFIRMED`, `PARTIALLY_RETURNED`, `RETURNED` y `CANCELLED`; para el MVP son compatibles `CONFIRMED` y, si existiera por materializacion externa, `PARTIALLY_RETURNED`.
-- Una venta `CANCELLED` no es retornable.
-- Una venta ya completamente retornada por suma de `return_items` confirmados no es retornable.
+- La venta `sale_id` existe, pertenece a la misma `branch_id` para el MVP y pertenece al mismo `business_id` via sucursal.
+- La venta original esta en estado compatible para devolucion. En db-2 los estados disponibles son `CONFIRMED`, `PARTIALLY_RETURNED`, `RETURNED` y `CANCELLED`; para el MVP son retornables `CONFIRMED` y `PARTIALLY_RETURNED`.
+- Una venta `RETURNED` no es retornable.
+- Una venta `CANCELLED` no es retornable; `CANCELLED` no significa borrado fisico.
+- Una venta ya completamente retornada por suma de `return_items` confirmados no es retornable, incluso si el estado materializado estuviera desfasado por un fallo previo a detectar.
 - Si el reembolso afecta caja fisica, existe `cash_session_id`, la sesion esta `OPEN`, pertenece a la misma sucursal y corresponde a la misma terminal segun politica MVP.
 - El metodo de reembolso existe en `payment_methods`, pertenece al `business_id` y esta activo.
 - Cada linea solicitada referencia un `sale_item` perteneciente a la venta original.
 
-db-2 no tiene columna de borrado logico en `sales`. La regla "no haber sido eliminada" queda como validacion conceptual sin soporte directo de columna en db-2.
+La elegibilidad para devolucion se determina con existencia de `sales.id`, pertenencia a `branch_id`, pertenencia al `business` correspondiente via sucursal, `sales.status` compatible y cantidades retornables restantes derivadas de `returns` + `return_items`.
 
 ## 5. Validaciones
 
@@ -128,7 +139,8 @@ db-2 no tiene columna de borrado logico en `sales`. La regla "no haber sido elim
 - Validar existencia de `sales.id = sale_id`.
 - Validar `sales.branch_id = branch_id` para el MVP.
 - Validar que la sucursal de la venta pertenezca al `business_id` esperado.
-- Validar estado compatible.
+- Validar estado compatible: `CONFIRMED` o `PARTIALLY_RETURNED`.
+- Rechazar `RETURNED` y `CANCELLED`.
 - Rechazar venta no retornable por reglas existentes.
 - Permitir devolucion parcial.
 - Permitir varias devoluciones confirmadas sobre la misma venta mientras la suma acumulada no exceda lo vendido por linea.
@@ -802,9 +814,10 @@ Cambio fisico requerido posterior a db-2, ya decidido:
 
 No se agrega `returns.terminal_id` al listado de cambios fisicos requeridos para el MVP. `terminal_id` queda como contexto operativo validado y auditado, no como identidad funcional de la devolucion.
 
+No se agrega `sales.deleted_at`, `sales.deleted_by`, `sales.is_deleted` ni columna equivalente al futuro modelo fisico requerido por este flujo. La preservacion historica de ventas confirmadas se garantiza mediante la politica de no eliminacion fisica en operacion normal.
+
 Gaps de diseno que siguen pendientes:
 
 - `DAMAGED`: db-2 no modela inventario danado ni movimiento fisico sin afectar saldo vendible; v0.1 propone no crear `inventory_movements` para `DAMAGED`.
 - Totales fiscales: `return_items` solo guarda `refund_amount`, no desglose de subtotal, descuento e impuesto devuelto.
 - Reembolsos multiples: db-2 solo permite un `refund_payment_method_id` por devolucion.
-- Borrado logico de venta: db-2 no tiene `sales.deleted_at`; la regla de venta no eliminada no tiene columna directa.
