@@ -57,7 +57,7 @@ La operacion requiere, como minimo:
 Cada `disposition` debe ser una de:
 
 - `RESTOCK`: mercancia vendible vuelve al inventario disponible.
-- `DAMAGED`: mercancia no vuelve al inventario vendible.
+- `DAMAGED`: mercancia recibida de vuelta, no apta para venta y tratada operativamente como merma inmediata.
 
 No se fija DTO ni API. El payload canonico exacto queda fuera de este documento.
 
@@ -84,7 +84,8 @@ Gaps fisicos relevantes detectados:
 
 - `returns` no tiene `request_hash`; el hash vive en `idempotency_keys`.
 - `return_items` no tiene columnas separadas de subtotal, descuento, impuesto o costo; solo persiste `refund_amount` monetario por linea.
-- db-2 no modela un saldo separado de inventario danado.
+
+Decision fisica para `DAMAGED`: db-2 no modela inventario no vendible, cuarentena ni almacen de danados; para el MVP no se requiere modelarlo porque `DAMAGED` se trata como merma inmediata fuera del inventario operativo controlado por el POS.
 
 Cambio fisico requerido posterior a db-2:
 
@@ -154,6 +155,7 @@ La elegibilidad para devolucion se determina con existencia de `sales.id`, perte
 - No aceptar lineas duplicadas en una misma solicitud; si se reciben, deben agregarse por `sale_item_id` antes de validar o rechazarse como payload ambiguo.
 - `quantity_base` solicitada debe ser mayor a cero.
 - `disposition` debe ser `RESTOCK` o `DAMAGED`.
+- Si `disposition = 'DAMAGED'`, `return_items.reason` debe informarse conceptualmente con un motivo operacional breve; si falta, devolver `RETURN_DAMAGED_REASON_REQUIRED`.
 - La suma solicitada por `sale_item_id` en la devolucion actual no debe exceder la cantidad retornable restante.
 
 ### Reembolso
@@ -183,6 +185,15 @@ Para cada `sale_item` incluido:
 - `requested_return_qty > 0`.
 - `requested_return_qty <= remaining_returnable`.
 
+`returned_qty_base` incluye tanto lineas `RESTOCK` como lineas `DAMAGED`. Una unidad devuelta como `DAMAGED` ya fue devuelta comercialmente y no puede devolverse otra vez, aunque no vuelva al inventario vendible.
+
+Ejemplo:
+
+- `sale_item.quantity_base = 5`;
+- devolucion 1: `2 RESTOCK`;
+- devolucion 2: `2 DAMAGED`;
+- `remaining_returnable = 1`.
+
 La validacion debe ejecutarse dentro de la transaccion operativa y despues de adquirir locks que serialicen devoluciones de la misma venta o de las mismas lineas.
 
 La fuente de verdad de lo ya devuelto son `returns` confirmadas y sus `return_items`. `sales.status` es un resumen operativo materializado y no sustituye este calculo detallado.
@@ -191,8 +202,8 @@ Dos devoluciones simultaneas no deben poder devolver dos veces la ultima cantida
 
 Despues de insertar una devolucion confirmada, y antes del `COMMIT`, se recalculan las cantidades devueltas acumuladas por cada `sale_item` de la venta:
 
-- si existe al menos una cantidad devuelta, pero todavia existe alguna cantidad retornable, `sales.status = 'PARTIALLY_RETURNED'`;
-- si todas las cantidades originales de todas las `sale_items` han sido devueltas completamente, `sales.status = 'RETURNED'`;
+- si existe al menos una cantidad devuelta, sea `RESTOCK` o `DAMAGED`, pero todavia existe alguna cantidad retornable, `sales.status = 'PARTIALLY_RETURNED'`;
+- si todas las cantidades originales de todas las `sale_items` han sido devueltas completamente, sea como `RESTOCK` o como `DAMAGED`, `sales.status = 'RETURNED'`;
 - no alterar una venta `CANCELLED`.
 
 Actualizar `sales.status` no constituye reescritura destructiva del historico de la venta; no cambia `sale_items`, snapshots ni totales originales.
@@ -255,7 +266,7 @@ Dentro de un unico `BEGIN` / `COMMIT` operativo:
 7. Bloquear `sales(sale_id)` y validar venta original.
 8. Bloquear `sale_items` solicitados en orden determinista y validar pertenencia a la venta.
 9. Calcular `returned_qty_base` y `remaining_returnable` con devoluciones confirmadas existentes dentro de la transaccion.
-10. Validar cantidades solicitadas.
+10. Validar cantidades solicitadas, disposicion y motivo operacional requerido para lineas `DAMAGED`.
 11. Validar `payment_methods` para el metodo de reembolso.
 12. Si el metodo afecta caja, bloquear y validar `cash_sessions` abierta de la misma sucursal y terminal.
 13. Calcular importes de reembolso por linea desde snapshots historicos.
@@ -266,10 +277,10 @@ Dentro de un unico `BEGIN` / `COMMIT` operativo:
 18. Insertar `returns` con `status='CONFIRMED'`, folio, venta, usuario, motivo, metodo, importe total y `client_operation_id` cuando la evolucion fisica exista.
 19. Insertar `return_items` con cantidades, disposicion, motivo por linea si aplica e importes.
 20. Para lineas `RESTOCK`, actualizar `inventory_balances.quantity_base`, recalcular `average_cost_base` por promedio ponderado, incrementar `version` e insertar `inventory_movements` tipo `SALE_RETURN` con delta positivo.
-21. Para lineas `DAMAGED`, no incrementar inventario vendible.
+21. Para lineas `DAMAGED`, no incrementar inventario vendible, no crear `SALE_RETURN` ni crear otro `inventory_movement`.
 22. Para lineas `RESTOCK`, reducir `replenishment_positions.demand_qty_base` solo hasta el limite aplicable de demanda existente, sin modificar `committed_qty_base`.
 23. Insertar `replenishment_movements` tipo `RETURN_RESTOCK` solo cuando la reduccion efectiva de demanda sea mayor a cero.
-24. Para lineas `DAMAGED`, no modificar `replenishment_positions` ni crear `replenishment_movements`.
+24. Para lineas `DAMAGED`, no modificar `replenishment_positions`, no reducir demanda y no crear `replenishment_movements`.
 25. Recalcular cantidades devueltas acumuladas por venta y actualizar `sales.status` a `PARTIALLY_RETURNED` o `RETURNED` segun corresponda.
 26. Si el reembolso afecta caja, insertar `cash_movements` tipo `RETURN_CASH` con `amount_delta` negativo y referencia a `returns`.
 27. Insertar `audit_log` con `action='RETURN_CONFIRMED'`.
@@ -431,7 +442,11 @@ Todo ocurre dentro del mismo `COMMIT` de la devolucion:
 
 ## 10. Inventario DAMAGED
 
-Si `return_items.disposition = 'DAMAGED'`, la mercancia no vuelve al inventario vendible.
+Decision definitiva: si `return_items.disposition = 'DAMAGED'`, la devolucion se trata como devolucion comercial con merma inmediata.
+
+Para el MVP, `DAMAGED` significa mercancia recibida de vuelta pero no apta para venta y tratada operativamente como merma inmediata. No significa stock vendible, stock disponible, cuarentena, inventario reparable, inventario pendiente de revision ni mercancia recuperable.
+
+La cantidad fisica devuelta queda fuera del inventario operativo controlado por el POS desde el momento de confirmar la devolucion. No se modela inventario no vendible, cuarentena ni almacen de danados.
 
 Efectos conceptuales:
 
@@ -439,15 +454,54 @@ Efectos conceptuales:
 - no modificar `inventory_balances.average_cost_base`;
 - no crear entrada vendible en `inventory_balances`;
 - no crear `inventory_movements.movement_type = 'SALE_RETURN'`;
+- no crear otro tipo de `inventory_movement`;
+- no generar `unit_cost_base` en `inventory_movements`;
+- no entrar en `R_total`;
+- no entrar en `V_return`;
 - no modificar `replenishment_positions.demand_qty_base`;
 - no modificar `replenishment_positions.committed_qty_base`;
 - no crear `replenishment_movements.movement_type = 'RETURN_RESTOCK'`;
-- no inventar tabla de inventario danado;
-- conservar la evidencia de la mercancia danada en `return_items.disposition`, `return_items.reason`, `returns.reason` y `audit_log`.
+- no reducir automaticamente demanda de reposicion;
+- no inventar tabla de inventario danado, cuarentena, reparacion, garantia, destruccion ni devolucion a proveedor.
 
-db-2 no modela un saldo separado de mercancia danada. Por tanto, una devolucion `DAMAGED` representa una devolucion comercial y monetaria, pero no conserva saldo fisico separado en inventario. Si el negocio requiere controlar existencia danada, cuarentena o merma pendiente, se necesitara diseno posterior de inventario no vendible, sin modificarlo en este hito.
+La venta original ya desconto la unidad del inventario vendible. Al regresar como `DAMAGED`, no debe reincorporarse a ese mismo saldo. Crear `inventory_movements.movement_type = 'SALE_RETURN'` implicaria una entrada positiva y exigiria coherencia con `inventory_balances.quantity_base`; como la unidad no vuelve al stock vendible, no se debe crear `SALE_RETURN`.
 
-DECISION / GAP A REVISAR: definir si una linea `DAMAGED` debe crear algun `inventory_movements` fisico sin afectar saldo vendible. Con el modelo actual, `inventory_movements` valida signo por tipo y esta orientado al saldo vendible; crear un movimiento `SALE_RETURN` positivo sin incrementar `inventory_balances` dejaria inconsistencia semantica. Para v0.1 se propone no crear `inventory_movements` para `DAMAGED`.
+Tampoco se inventa otro `movement_type` en este hito. Para `CONFIRMAR DEVOLUCION v0.1`, el unico cambio fisico requerido posterior a db-2 sigue siendo:
+
+- `returns.client_operation_id TEXT NOT NULL`;
+- `UNIQUE(branch_id, client_operation_id)`.
+
+No agregar al futuro modelo fisico requerido por este flujo:
+
+- `damaged_inventory`;
+- `quarantine_inventory`;
+- `inventory_damage_balances`;
+- `warehouse_damaged`;
+- tablas equivalentes;
+- nuevo `inventory_movement_type`.
+
+La evidencia de la devolucion `DAMAGED` queda persistida mediante:
+
+- `returns`;
+- `return_items` con `disposition = 'DAMAGED'`, `quantity_base`, `refund_amount` y `reason`;
+- `audit_log` con `action = 'RETURN_CONFIRMED'` y resumen por disposicion.
+
+Por tanto no se pierde trazabilidad del hecho, aunque la unidad no forme parte de `inventory_balances`.
+
+Para `DAMAGED`, `return_items.reason` debe ser requerido conceptualmente. Debe describir de forma breve el motivo operacional, por ejemplo:
+
+- roto;
+- quemado;
+- incompleto;
+- golpeado;
+- defecto visible;
+- no apto para reventa.
+
+No se crea catalogo ni enum de motivos ahora. No se modifica schema si `return_items.reason` actualmente permite `NULL`. La obligatoriedad se protege a nivel de servicio/transaccion en la implementacion futura. Error estable: `RETURN_DAMAGED_REASON_REQUIRED`.
+
+`sale_items.unit_cost_snapshot` permanece disponible como historico de costo de la venta, pero no se usa para crear una entrada de inventario `DAMAGED`.
+
+Si en el futuro el negocio necesita controlar fisicamente cuarentena, reparacion, garantia, devolucion a proveedor o destruccion posterior, eso requerira un modulo/modelo separado de inventario no vendible. Queda fuera del MVP actual.
 
 ## 11. Reposicion
 
@@ -477,6 +531,8 @@ Para cada `return_item` con `disposition = 'DAMAGED'`:
 - no modificar `replenishment_positions.demand_qty_base`;
 - no modificar `committed_qty_base`;
 - no crear `replenishment_movements.movement_type = 'RETURN_RESTOCK'`.
+
+`DAMAGED` no reduce `demand_qty_base` automaticamente porque la mercancia danada no vuelve al stock vendible y la necesidad operativa de reposicion continua.
 
 El nombre `RETURN_RESTOCK` queda semanticamente correcto porque solo se usa cuando la mercancia vuelve a stock vendible y efectivamente reduce demanda.
 
@@ -535,6 +591,8 @@ Cuando el reembolso afecta caja:
 - usar `actor_user_id = user_id`.
 
 No se modifican los movimientos originales de la venta.
+
+`DAMAGED` sigue siendo una devolucion comercial valida. Por tanto, genera `return_items.refund_amount`, participa en `returns.refund_amount`, puede generar `RETURN_CASH` si el metodo afecta caja, consume cantidad retornable de la `sale_item` y participa en el calculo de `sales.status`. La disposicion fisica del producto no cambia el derecho monetario determinado por la devolucion aceptada.
 
 Si el metodo de reembolso no afecta caja fisica, puede no existir `cash_session_id`. En ese caso, la terminal desde la que se confirmo la devolucion queda registrada en `audit_log.terminal_id`; `audit_log` es la fuente de trazabilidad operacional del dispositivo.
 
@@ -721,6 +779,23 @@ Dentro del mismo `COMMIT` deben quedar consistentes:
 - `audit_log`;
 - `idempotency_keys.status='COMPLETED'`.
 
+Dentro del mismo `COMMIT` deben quedar consistentes para la porcion `DAMAGED`:
+
+- `returns`;
+- `return_items`;
+- `refund_amount`;
+- `cash_movements` si aplica;
+- `sales.status`;
+- `audit_log`;
+- idempotencia.
+
+La porcion `DAMAGED` no debe generar efecto sobre:
+
+- `inventory_balances`;
+- `inventory_movements`;
+- `replenishment_positions`;
+- `replenishment_movements`.
+
 Si falla cualquier paso antes de `COMMIT`, PostgreSQL debe hacer `ROLLBACK` completo. No debe quedar:
 
 - devolucion sin reembolso registrado;
@@ -789,6 +864,7 @@ Codigos estables propuestos:
 - `RETURN_QUANTITY_EXCEEDED`: cantidad solicitada supera lo retornable restante.
 - `RETURN_ITEM_SALE_MISMATCH`: el `sale_item_id` no pertenece a `sale_id`.
 - `RETURN_DISPOSITION_INVALID`: disposicion distinta de `RESTOCK` o `DAMAGED`.
+- `RETURN_DAMAGED_REASON_REQUIRED`: se solicito `disposition = 'DAMAGED'` sin motivo operacional.
 - `RETURN_REFUND_METHOD_INVALID`: metodo de reembolso inexistente, inactivo o de otro negocio.
 - `RETURN_CASH_SESSION_REQUIRED`: el metodo afecta caja y no se informo `cash_session_id`.
 - `RETURN_CASH_SESSION_CLOSED`: la caja no esta `OPEN`.
@@ -818,6 +894,5 @@ No se agrega `sales.deleted_at`, `sales.deleted_by`, `sales.is_deleted` ni colum
 
 Gaps de diseno que siguen pendientes:
 
-- `DAMAGED`: db-2 no modela inventario danado ni movimiento fisico sin afectar saldo vendible; v0.1 propone no crear `inventory_movements` para `DAMAGED`.
 - Totales fiscales: `return_items` solo guarda `refund_amount`, no desglose de subtotal, descuento e impuesto devuelto.
 - Reembolsos multiples: db-2 solo permite un `refund_payment_method_id` por devolucion.
