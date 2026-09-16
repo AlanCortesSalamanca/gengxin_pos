@@ -45,13 +45,13 @@ La operacion requiere, como minimo:
 - `branch_id` objetivo de la devolucion.
 - `terminal_id` autenticada como contexto operativo de ejecucion; no se persiste directamente en `returns` para el MVP.
 - `user_id` actor.
-- `cash_session_id` solo si el reembolso afecta caja fisica.
+- `cash_session_id` solo si `refund_amount > 0` y el unico metodo de reembolso afecta caja fisica.
 - `sale_id` de la venta original.
 - `client_operation_id` generado por el POS para deduplicacion local de la devolucion.
 - `idempotency_key` de operacion critica.
 - `request_hash` canonico del payload conceptual.
 - motivo general de la devolucion.
-- metodo de reembolso, resuelto contra `payment_methods`.
+- metodo de reembolso unico, resuelto contra `payment_methods`, obligatorio solo si `refund_amount > 0`.
 - lineas a devolver con `sale_item_id`, `quantity_base` a devolver y `disposition`.
 
 Cada `disposition` debe ser una de:
@@ -86,6 +86,8 @@ Gaps fisicos relevantes detectados:
 - `return_items` no tiene columnas separadas de subtotal, descuento, impuesto o costo; solo persiste `refund_amount` monetario por linea.
 
 Decision fisica para `DAMAGED`: db-2 no modela inventario no vendible, cuarentena ni almacen de danados; para el MVP no se requiere modelarlo porque `DAMAGED` se trata como merma inmediata fuera del inventario operativo controlado por el POS.
+
+Decision fisica para reembolsos: db-2 ya soporta la politica MVP de un unico metodo por devolucion mediante `returns.refund_amount` y `returns.refund_payment_method_id`. No se requiere `return_payments`, `return_refund_payments`, `refund_allocations` ni tabla equivalente.
 
 Cambio fisico requerido posterior a db-2:
 
@@ -127,8 +129,9 @@ No se modifica schema en este documento.
 - Una venta `RETURNED` no es retornable.
 - Una venta `CANCELLED` no es retornable; `CANCELLED` no significa borrado fisico.
 - Una venta ya completamente retornada por suma de `return_items` confirmados no es retornable, incluso si el estado materializado estuviera desfasado por un fallo previo a detectar.
-- Si el reembolso afecta caja fisica, existe `cash_session_id`, la sesion esta `OPEN`, pertenece a la misma sucursal y corresponde a la misma terminal segun politica MVP.
-- El metodo de reembolso existe en `payment_methods`, pertenece al `business_id` y esta activo.
+- Si `refund_amount > 0`, existe exactamente un metodo de reembolso en `payment_methods`, pertenece al `business_id` y esta activo.
+- Si `refund_amount > 0` y el metodo de reembolso afecta caja fisica, existe `cash_session_id`, la sesion esta `OPEN`, pertenece a la misma sucursal y corresponde a la misma terminal segun politica MVP.
+- Si `refund_amount = 0`, no se requiere metodo de reembolso ni `cash_session_id`.
 - Cada linea solicitada referencia un `sale_item` perteneciente a la venta original.
 
 La elegibilidad para devolucion se determina con existencia de `sales.id`, pertenencia a `branch_id`, pertenencia al `business` correspondiente via sucursal, `sales.status` compatible y cantidades retornables restantes derivadas de `returns` + `return_items`.
@@ -160,11 +163,15 @@ La elegibilidad para devolucion se determina con existencia de `sales.id`, perte
 
 ### Reembolso
 
-- El metodo de reembolso debe existir, pertenecer al negocio y estar activo.
 - El importe total de reembolso se calcula desde snapshots historicos de `sale_items`, no desde precios vigentes.
 - El `refund_amount` de `returns` debe ser la suma exacta de `return_items.refund_amount` redondeados conforme a la politica monetaria.
-- Si `payment_methods.affects_cash = TRUE`, debe existir caja abierta y se crea `cash_movements` negativo.
-- Si `payment_methods.affects_cash = FALSE`, no se crea movimiento de caja.
+- Si `returns.refund_amount > 0`, debe existir exactamente un `returns.refund_payment_method_id`.
+- Si `returns.refund_amount > 0`, el metodo de reembolso debe existir, pertenecer al negocio y estar activo.
+- Si `returns.refund_amount > 0` y falta metodo de reembolso, devolver `RETURN_REFUND_METHOD_REQUIRED`.
+- Si el request intenta dividir una misma devolucion entre mas de un metodo de reembolso, devolver `RETURN_REFUND_SPLIT_NOT_SUPPORTED`.
+- Si `returns.refund_amount > 0` y `payment_methods.affects_cash = TRUE`, debe existir caja abierta y se crea un unico `cash_movements` negativo por el total de `returns.refund_amount`.
+- Si `returns.refund_amount > 0` y `payment_methods.affects_cash = FALSE`, no se crea movimiento de caja.
+- Si `returns.refund_amount = 0`, `returns.refund_payment_method_id = NULL`, `cash_session_id = NULL` y no se crea `cash_movements`.
 
 ### Autorizacion
 
@@ -267,24 +274,25 @@ Dentro de un unico `BEGIN` / `COMMIT` operativo:
 8. Bloquear `sale_items` solicitados en orden determinista y validar pertenencia a la venta.
 9. Calcular `returned_qty_base` y `remaining_returnable` con devoluciones confirmadas existentes dentro de la transaccion.
 10. Validar cantidades solicitadas, disposicion y motivo operacional requerido para lineas `DAMAGED`.
-11. Validar `payment_methods` para el metodo de reembolso.
-12. Si el metodo afecta caja, bloquear y validar `cash_sessions` abierta de la misma sucursal y terminal.
-13. Calcular importes de reembolso por linea desde snapshots historicos.
-14. Bloquear `inventory_balances` para productos con `disposition='RESTOCK'`.
-15. Bloquear o preparar `replenishment_positions` para productos/canal con lineas `RESTOCK`.
-16. Bloquear `document_sequences` de `DEV` para la sucursal.
-17. Reservar folio `DEV` incrementando `next_number` dentro de la misma transaccion.
-18. Insertar `returns` con `status='CONFIRMED'`, folio, venta, usuario, motivo, metodo, importe total y `client_operation_id` cuando la evolucion fisica exista.
-19. Insertar `return_items` con cantidades, disposicion, motivo por linea si aplica e importes.
-20. Para lineas `RESTOCK`, actualizar `inventory_balances.quantity_base`, recalcular `average_cost_base` por promedio ponderado, incrementar `version` e insertar `inventory_movements` tipo `SALE_RETURN` con delta positivo.
-21. Para lineas `DAMAGED`, no incrementar inventario vendible, no crear `SALE_RETURN` ni crear otro `inventory_movement`.
-22. Para lineas `RESTOCK`, reducir `replenishment_positions.demand_qty_base` solo hasta el limite aplicable de demanda existente, sin modificar `committed_qty_base`.
-23. Insertar `replenishment_movements` tipo `RETURN_RESTOCK` solo cuando la reduccion efectiva de demanda sea mayor a cero.
-24. Para lineas `DAMAGED`, no modificar `replenishment_positions`, no reducir demanda y no crear `replenishment_movements`.
-25. Recalcular cantidades devueltas acumuladas por venta y actualizar `sales.status` a `PARTIALLY_RETURNED` o `RETURNED` segun corresponda.
-26. Si el reembolso afecta caja, insertar `cash_movements` tipo `RETURN_CASH` con `amount_delta` negativo y referencia a `returns`.
-27. Insertar `audit_log` con `action='RETURN_CONFIRMED'`.
-28. Marcar `idempotency_keys` como `COMPLETED`, con `result_entity_type='returns'`, `result_entity_id=returns.id`, `response_body` minima, errores nulos, `locked_until=NULL` y `expires_at` definido.
+11. Calcular importes de reembolso por linea desde snapshots historicos y derivar `returns.refund_amount` como suma exacta.
+12. Validar la politica de metodo unico de reembolso.
+13. Si `refund_amount > 0`, validar `payment_methods` para el unico metodo de reembolso; si `refund_amount = 0`, forzar metodo y caja a `NULL`.
+14. Si `refund_amount > 0` y el metodo afecta caja, bloquear y validar `cash_sessions` abierta de la misma sucursal y terminal.
+15. Bloquear `inventory_balances` para productos con `disposition='RESTOCK'`.
+16. Bloquear o preparar `replenishment_positions` para productos/canal con lineas `RESTOCK`.
+17. Bloquear `document_sequences` de `DEV` para la sucursal.
+18. Reservar folio `DEV` incrementando `next_number` dentro de la misma transaccion.
+19. Insertar `returns` con `status='CONFIRMED'`, folio, venta, usuario, motivo, metodo unico cuando aplique, importe total y `client_operation_id` cuando la evolucion fisica exista.
+20. Insertar `return_items` con cantidades, disposicion, motivo por linea si aplica e importes.
+21. Para lineas `RESTOCK`, actualizar `inventory_balances.quantity_base`, recalcular `average_cost_base` por promedio ponderado, incrementar `version` e insertar `inventory_movements` tipo `SALE_RETURN` con delta positivo.
+22. Para lineas `DAMAGED`, no incrementar inventario vendible, no crear `SALE_RETURN` ni crear otro `inventory_movement`.
+23. Para lineas `RESTOCK`, reducir `replenishment_positions.demand_qty_base` solo hasta el limite aplicable de demanda existente, sin modificar `committed_qty_base`.
+24. Insertar `replenishment_movements` tipo `RETURN_RESTOCK` solo cuando la reduccion efectiva de demanda sea mayor a cero.
+25. Para lineas `DAMAGED`, no modificar `replenishment_positions`, no reducir demanda y no crear `replenishment_movements`.
+26. Recalcular cantidades devueltas acumuladas por venta y actualizar `sales.status` a `PARTIALLY_RETURNED` o `RETURNED` segun corresponda.
+27. Si `refund_amount > 0` y el metodo afecta caja, insertar un unico `cash_movements` tipo `RETURN_CASH` con `amount_delta = -returns.refund_amount` y referencia a `returns`.
+28. Insertar `audit_log` con `action='RETURN_CONFIRMED'`.
+29. Marcar `idempotency_keys` como `COMPLETED`, con `result_entity_type='returns'`, `result_entity_id=returns.id`, `response_body` minima, errores nulos, `locked_until=NULL` y `expires_at` definido.
 
 ### Reconciliacion por devolucion existente
 
@@ -570,33 +578,90 @@ El reembolso tiene dos dimensiones distintas:
 La devolucion monetaria se registra en:
 
 - `returns.refund_amount` como total devuelto;
-- `returns.refund_payment_method_id` como metodo de reembolso;
+- `returns.refund_payment_method_id` como metodo unico de reembolso cuando `refund_amount > 0`;
 - `return_items.refund_amount` como importe por linea.
+
+Decision definitiva: una devolucion usa como maximo un metodo de reembolso. No se soporta split refund dentro del mismo documento `returns`.
+
+Para una devolucion con `returns.refund_amount > 0`, debe existir exactamente un `returns.refund_payment_method_id`. Ese metodo representa el metodo monetario de toda la devolucion.
+
+No dividir una misma devolucion entre:
+
+- efectivo + transferencia;
+- efectivo + tarjeta;
+- dos transferencias;
+- dos metodos cualesquiera.
+
+No crear tabla `return_payments`, `return_refund_payments`, `refund_allocations` ni tabla equivalente para MVP. La decision usa directamente el modelo existente `returns.refund_amount` y `returns.refund_payment_method_id`; por tanto no requiere cambio fisico posterior a db-2.
+
+Si `returns.refund_amount > 0`:
+
+- `refund_payment_method_id` es obligatorio conceptualmente;
+- el metodo debe existir;
+- el metodo debe pertenecer al `business_id`;
+- el metodo debe estar activo;
+- si falta, devolver `RETURN_REFUND_METHOD_REQUIRED`;
+- si es invalido, inactivo o de otro negocio, devolver `RETURN_REFUND_METHOD_INVALID`.
+
+Si el importe calculado de la devolucion es exactamente `refund_amount = 0`:
+
+- `returns.refund_payment_method_id = NULL`;
+- `cash_session_id = NULL`;
+- no crear `cash_movements`, aunque conceptualmente el usuario haya seleccionado un metodo en la interfaz.
+
+La operacion sigue siendo una devolucion valida porque puede existir una linea historica cuyo total reembolsable sea cero. No se inventa pago ni reembolso de monto cero.
 
 El impacto fisico en caja depende de `payment_methods.affects_cash` del metodo de reembolso:
 
-- si `affects_cash = TRUE`, crear `cash_movements.movement_type='RETURN_CASH'` con `amount_delta < 0`;
-- si `affects_cash = FALSE`, no crear `cash_movements`.
+- si `refund_amount > 0` y `affects_cash = TRUE`, crear un unico `cash_movements.movement_type='RETURN_CASH'` con `amount_delta = -returns.refund_amount`;
+- si `refund_amount > 0` y `affects_cash = FALSE`, no crear `cash_movements`;
+- si `refund_amount = 0`, no crear `cash_movements`.
 
 No todos los reembolsos afectan caja fisica. Tarjeta, transferencia, saldo a favor u otro metodo futuro pueden registrar devolucion monetaria sin movimiento en caja, siempre que el metodo exista en `payment_methods` y no afecte efectivo.
 
-Cuando el reembolso afecta caja:
+Cuando `refund_amount > 0` y el reembolso afecta caja:
 
 - `cash_session_id` es obligatorio;
 - la sesion debe estar `OPEN`;
 - la sesion debe pertenecer a `branch_id`;
 - para MVP, `cash_sessions.terminal_id` debe corresponder a la `terminal_id` autenticada;
-- insertar `cash_movements` negativo;
+- insertar un unico `cash_movements` negativo por el total monetario efectivo del documento `returns`;
+- no crear un `cash_movements` por `return_item`;
 - usar referencia a `returns`;
 - usar `actor_user_id = user_id`.
 
+Si `refund_amount > 0` y `payment_methods.affects_cash = FALSE`:
+
+- no se requiere `cash_session_id`;
+- no se crea `cash_movements`;
+- `refund_payment_method_id` si se persiste en `returns`.
+
+La devolucion monetaria sigue existiendo aunque no afecte efectivo fisico.
+
 No se modifican los movimientos originales de la venta.
+
+La especificacion actual no define una regla que obligue al metodo de reembolso a coincidir con un `sale_payments` original. Para `CONFIRMAR DEVOLUCION v0.1`, no se inventa una restriccion automatica de igualdad con el metodo de pago original. El metodo de reembolso seleccionado y autorizado para la devolucion es el que se guarda en `returns.refund_payment_method_id`.
+
+Las politicas futuras de negocio o proveedor de pagos que obliguen a devolver a la tarjeta o cuenta original quedan fuera de este contrato MVP. No se modifica `sale_payments`.
+
+Aunque una venta original tenga varias filas en `sale_payments`, una devolucion individual continua utilizando un unico `refund_payment_method_id`. No se prorratea automaticamente el reembolso entre los metodos originales y no se reconstruye el mix de pago original.
+
+Una venta puede tener varias devoluciones independientes. Cada documento `returns` puede elegir su unico metodo de reembolso, siempre que cada devolucion cumpla sus propias reglas de cantidad retornable e importe.
+
+Ejemplo valido:
+
+- Devolucion 1: `refund_amount = 300`, `refund_method = CASH`;
+- Devolucion 2: `refund_amount = 200`, `refund_method = TRANSFER`.
+
+Ejemplo no permitido en MVP:
+
+- una sola devolucion de `500` dividida en `300 CASH` y `200 TRANSFER`.
+
+Si el negocio necesita split refund real en el futuro, sera una evolucion funcional y fisica separada.
 
 `DAMAGED` sigue siendo una devolucion comercial valida. Por tanto, genera `return_items.refund_amount`, participa en `returns.refund_amount`, puede generar `RETURN_CASH` si el metodo afecta caja, consume cantidad retornable de la `sale_item` y participa en el calculo de `sales.status`. La disposicion fisica del producto no cambia el derecho monetario determinado por la devolucion aceptada.
 
-Si el metodo de reembolso no afecta caja fisica, puede no existir `cash_session_id`. En ese caso, la terminal desde la que se confirmo la devolucion queda registrada en `audit_log.terminal_id`; `audit_log` es la fuente de trazabilidad operacional del dispositivo.
-
-DECISION / GAP A REVISAR: db-2 no contiene tabla `return_payments` ni permite varios metodos de reembolso en una devolucion. v0.1 asume un solo `refund_payment_method_id` por `returns`.
+Si no existe movimiento de caja, la terminal desde la que se confirmo la devolucion queda registrada en `audit_log.terminal_id`; `audit_log` es la fuente de trazabilidad operacional del dispositivo.
 
 ## 13. Totales de devolucion
 
@@ -701,6 +766,8 @@ Sirve para identificar persistentemente la devolucion logica e impedir una segun
 
 El nuevo `client_operation_id` persistente no sustituye `request_hash`. Si se reutiliza la misma `idempotency_key` con `request_hash` distinto, devolver `RETURN_IDEMPOTENCY_KEY_REUSED`.
 
+El metodo de reembolso forma parte del payload canonico que contribuye a `request_hash`. Por tanto, la misma `idempotency_key` con `refund_payment_method_id` diferente debe producir un `request_hash` diferente y caer en `RETURN_IDEMPOTENCY_KEY_REUSED` si esa clave ya fue utilizada.
+
 Para MVP no es necesario guardar otro payload hash en `returns`, porque `request_hash` ya vive en `idempotency_keys`. No se define todavia fingerprint adicional sobre `returns`.
 
 ### Advisory lock
@@ -768,11 +835,13 @@ Una devolucion confirmada debe ser atomica.
 Dentro del mismo `COMMIT` deben quedar consistentes:
 
 - `returns`;
+- `returns.refund_amount`;
+- `returns.refund_payment_method_id`, obligatorio si `refund_amount > 0` y `NULL` si `refund_amount = 0`;
 - `return_items`;
 - `sales.status` como estado operativo materializado;
 - `inventory_balances.quantity_base`, `average_cost_base` y `version` para lineas `RESTOCK`;
 - `inventory_movements` para lineas `RESTOCK`;
-- `cash_movements` si aplica;
+- un unico `cash_movements RETURN_CASH` si `refund_amount > 0` y `affects_cash = TRUE`;
 - `replenishment_positions` si aplica reduccion de demanda por `RESTOCK`;
 - `replenishment_movements` solo si `demand_reduction_base > 0`;
 - `document_sequences` para `DEV`;
@@ -804,6 +873,9 @@ Si falla cualquier paso antes de `COMMIT`, PostgreSQL debe hacer `ROLLBACK` comp
 - incremento de `inventory_balances.version` sin devolucion;
 - `inventory_movements SALE_RETURN` sin devolucion confirmada;
 - caja disminuida sin devolucion;
+- reembolso registrado sin movimiento de caja cuando `affects_cash = TRUE`;
+- movimiento de caja sin devolucion;
+- dos metodos asociados al mismo `returns`;
 - demanda compensada sin devolucion;
 - folio/documento parcial;
 - `sales.status = 'RETURNED'` o `PARTIALLY_RETURNED` si la devolucion correspondiente no quedo confirmada;
@@ -865,7 +937,9 @@ Codigos estables propuestos:
 - `RETURN_ITEM_SALE_MISMATCH`: el `sale_item_id` no pertenece a `sale_id`.
 - `RETURN_DISPOSITION_INVALID`: disposicion distinta de `RESTOCK` o `DAMAGED`.
 - `RETURN_DAMAGED_REASON_REQUIRED`: se solicito `disposition = 'DAMAGED'` sin motivo operacional.
+- `RETURN_REFUND_METHOD_REQUIRED`: `refund_amount > 0` y no se proporciono metodo de reembolso.
 - `RETURN_REFUND_METHOD_INVALID`: metodo de reembolso inexistente, inactivo o de otro negocio.
+- `RETURN_REFUND_SPLIT_NOT_SUPPORTED`: el request intenta dividir una misma devolucion entre mas de un metodo de reembolso.
 - `RETURN_CASH_SESSION_REQUIRED`: el metodo afecta caja y no se informo `cash_session_id`.
 - `RETURN_CASH_SESSION_CLOSED`: la caja no esta `OPEN`.
 - `RETURN_CASH_SESSION_MISMATCH`: la caja no pertenece a la sucursal o terminal esperada.
@@ -892,7 +966,13 @@ No se agrega `returns.terminal_id` al listado de cambios fisicos requeridos para
 
 No se agrega `sales.deleted_at`, `sales.deleted_by`, `sales.is_deleted` ni columna equivalente al futuro modelo fisico requerido por este flujo. La preservacion historica de ventas confirmadas se garantiza mediante la politica de no eliminacion fisica en operacion normal.
 
+Decision definitiva sobre reembolsos multiples:
+
+- un unico metodo de reembolso por `returns`;
+- split refund fuera del MVP;
+- no se agrega `return_payments`, `return_refund_payments`, `refund_allocations` ni tabla equivalente;
+- no se requiere cambio fisico por esta decision.
+
 Gaps de diseno que siguen pendientes:
 
-- Totales fiscales: `return_items` solo guarda `refund_amount`, no desglose de subtotal, descuento e impuesto devuelto.
-- Reembolsos multiples: db-2 solo permite un `refund_payment_method_id` por devolucion.
+- Desglose fiscal / tratamiento CFDI: `return_items` solo guarda `refund_amount`, no desglose de subtotal, descuento e impuesto devuelto.
