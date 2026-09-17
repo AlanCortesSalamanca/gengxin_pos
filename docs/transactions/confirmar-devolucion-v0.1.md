@@ -8,7 +8,7 @@ Este documento disena conceptualmente la transaccion `CONFIRMAR DEVOLUCION`. No 
 
 ## Estado del diseno
 
-- Estado: BORRADOR INICIAL
+- Estado: DISENO FUNCIONAL CERRADO / PENDIENTE DE EVOLUCION FISICA
 - Version: v0.1
 - Compatible funcionalmente con especificacion maestra v0.5
 - Requiere evolucion fisica posterior a PostgreSQL v0.5-db-2 para `returns.client_operation_id`
@@ -80,10 +80,10 @@ Tablas y columnas verificadas en `database/schema-v0.5-db-2.sql`:
 - `idempotency_keys`: `business_id`, `branch_id`, `operation_type`, `idempotency_key`, `request_hash`, `status`, resultado, `response_body`, error, `locked_until`, `expires_at`.
 - `audit_log`: `actor_user_id`, `branch_id`, `terminal_id`, `action`, `entity_type`, `entity_id`, `entity_public_id`, `before_data`, `after_data`, `context`, red y timestamps.
 
-Gaps fisicos relevantes detectados:
+Observaciones fisicas relevantes contra db-2:
 
 - `returns` no tiene `request_hash`; el hash vive en `idempotency_keys`.
-- `return_items` no tiene columnas separadas de subtotal, descuento, impuesto o costo; solo persiste `refund_amount` monetario por linea.
+- `return_items` no tiene columnas separadas de subtotal, descuento, impuesto o costo; para `CONFIRMAR DEVOLUCION v0.1` no se requieren porque la devolucion operativa no sustituye al documento fiscal.
 
 Decision fisica para `DAMAGED`: db-2 no modela inventario no vendible, cuarentena ni almacen de danados; para el MVP no se requiere modelarlo porque `DAMAGED` se trata como merma inmediata fuera del inventario operativo controlado por el POS.
 
@@ -94,7 +94,7 @@ Cambio fisico requerido posterior a db-2:
 - agregar `returns.client_operation_id TEXT NOT NULL`;
 - agregar unicidad conceptual `UNIQUE(branch_id, client_operation_id)`.
 
-Esta decision ya queda cerrada para el diseno transaccional, pero no se modifica db-2. db-2 permanece congelado como version validada. No se crea db-3 ni migracion en este micro-hito; la evolucion fisica se hara posteriormente, una vez cerradas las decisiones de diseno que puedan afectar schema.
+Esta decision ya queda cerrada para el diseno transaccional, pero no se modifica db-2. db-2 permanece congelado como version validada. No se crea db-3 ni migracion en este micro-hito; la evolucion fisica se hara posteriormente en un hito separado.
 
 Decision definitiva sobre `terminal_id` para MVP:
 
@@ -663,7 +663,7 @@ Si el negocio necesita split refund real en el futuro, sera una evolucion funcio
 
 Si no existe movimiento de caja, la terminal desde la que se confirmo la devolucion queda registrada en `audit_log.terminal_id`; `audit_log` es la fuente de trazabilidad operacional del dispositivo.
 
-## 13. Totales de devolucion
+## 13. Totales de devolucion y frontera fiscal
 
 Los importes se calculan desde snapshots historicos de `sale_items`:
 
@@ -687,9 +687,9 @@ Politica monetaria:
 Regla determinista propuesta para devolucion parcial:
 
 - calcular `ratio = requested_quantity_base / sale_items.quantity_base` con precision decimal suficiente;
-- `refund_subtotal_raw = sale_items.subtotal * ratio`;
-- `refund_discount_raw = sale_items.discount_amount * ratio` solo para explicacion/auditoria conceptual, porque db-2 no lo persiste por separado;
-- `refund_tax_raw = sale_items.tax_total * ratio`;
+- `refund_subtotal_raw = sale_items.subtotal * ratio` solo como explicacion conceptual del calculo operativo;
+- `refund_discount_raw = sale_items.discount_amount * ratio` solo como explicacion conceptual del calculo operativo;
+- `refund_tax_raw = sale_items.tax_total * ratio` solo como explicacion conceptual del calculo operativo;
 - `refund_total_raw = sale_items.total * ratio`;
 - almacenar `return_items.refund_amount = ROUND(refund_total_raw, 2)`.
 
@@ -699,9 +699,136 @@ Para evitar que varias devoluciones parciales acumulen diferencias de centavos:
 - si no es la ultima devolucion de la linea, usar `ROUND(sale_items.total * ratio, 2)`;
 - validar que el acumulado de `return_items.refund_amount` confirmados para la linea nunca exceda `sale_items.total`.
 
-Esta regla maneja lineas con descuento, impuesto y cantidad mayor a 1 porque prorratea el total historico efectivamente cobrado de la linea. Los componentes fiscales detallados y notas de credito SAT/CFDI quedan fuera de este documento.
+Esta regla maneja lineas con descuento, impuesto y cantidad mayor a 1 porque prorratea el total historico efectivamente cobrado de la linea. Determina el importe operativo devuelto al cliente.
 
-DECISION / GAP A REVISAR: db-2 solo persiste `refund_amount` por linea, no el desglose de subtotal, descuento e impuesto devuelto. Si se requiere nota de credito fiscal detallada desde la devolucion, podria necesitarse persistencia adicional en otro hito.
+`refund_subtotal_raw`, `refund_tax_raw` y `refund_discount_raw` no son valores fiscales autoritativos para construir un futuro CFDI. Pueden mantenerse como explicacion conceptual del calculo operativo, pero el futuro modulo fiscal debe aplicar sus propias reglas fiscales vigentes a partir de los snapshots correspondientes.
+
+Decision definitiva: `CONFIRMAR DEVOLUCION` es una transaccion operativa. La correccion fiscal derivada de una devolucion es responsabilidad del modulo fiscal y de una transaccion separada.
+
+`CONFIRMAR DEVOLUCION` es responsable de:
+
+- `returns`;
+- `return_items`;
+- cantidades retornables;
+- refund;
+- caja;
+- inventario;
+- costo;
+- reposicion;
+- `sales.status`;
+- folio `DEV`;
+- auditoria;
+- idempotencia operacional.
+
+El modulo fiscal es responsable posteriormente de:
+
+- determinar si existe CFDI fiscal que deba corregirse;
+- construir el comprobante fiscal que corresponda;
+- relacion fiscal con CFDI previo;
+- conceptos e impuestos fiscales;
+- comunicacion con PAC;
+- timbrado;
+- UUID;
+- XML;
+- PDF;
+- cancelaciones fiscales cuando correspondan;
+- estados y reintentos fiscales.
+
+`CONFIRMAR DEVOLUCION` no debe realizar trabajo de PAC.
+
+Una devolucion operativa valida no depende del exito de una operacion fiscal. Si cumple todas las reglas operativas, puede quedar `CONFIRMED` aunque:
+
+- el PAC este caido;
+- falle posteriormente el timbrado fiscal;
+- todavia no se haya iniciado la correccion fiscal;
+- la venta nunca haya tenido CFDI.
+
+Un fallo fiscal posterior no debe hacer `ROLLBACK` de:
+
+- devolucion;
+- reembolso;
+- caja;
+- inventario;
+- reposicion;
+- `sales.status`.
+
+Si la venta original no tiene CFDI timbrado, `CONFIRMAR DEVOLUCION` no crea ningun documento fiscal. La devolucion se confirma normalmente. La logica de facturacion futura debera decidir como considerar las devoluciones ya confirmadas al momento de generar un CFDI; eso pertenece al modulo fiscal y no se resuelve aqui.
+
+Si la venta tiene un CFDI timbrado, la devolucion operativa continua confirmandose de forma independiente. La correccion fiscal correspondiente se procesa posteriormente mediante el modulo fiscal conforme a las reglas vigentes. La devolucion operativa y el CFDI son entidades relacionadas pero separadas.
+
+`CONFIRMAR DEVOLUCION` no debe:
+
+- cancelar CFDI;
+- timbrar;
+- llamar al PAC;
+- modificar `invoices` dentro de este `COMMIT`;
+- hacer depender el `COMMIT` operativo de la respuesta del PAC.
+
+Las reglas fiscales vigentes pueden requerir un CFDI de tipo `E` / egreso para devoluciones, descuentos o bonificaciones. La determinacion exacta de tipo de comprobante, relacion con UUID previo, claves de relacion, forma/metodo de pago fiscal, impuestos, objeto de impuesto, reglas de cancelacion, construccion XML y validaciones SAT/PAC no forma parte de `CONFIRMAR DEVOLUCION v0.1`. Debe verificarse contra reglas SAT vigentes cuando se disene la transaccion fiscal correspondiente. No codificar aqui reglas fiscales que puedan cambiar.
+
+Decision MVP: no agregar a `return_items` un desglose fiscal solo para `CONFIRMAR DEVOLUCION`:
+
+- `refund_subtotal`;
+- `refund_discount`;
+- `refund_tax`;
+- `tax_base`;
+- `tax_rate`;
+- `tax_amount`;
+- `fiscal_snapshot`;
+- columnas equivalentes.
+
+`return_items` conserva:
+
+- `sale_item_id`;
+- `quantity_base`;
+- `disposition`;
+- `refund_amount`;
+- `reason`.
+
+El objetivo de `return_items` es representar la devolucion operativa, no sustituir al documento fiscal.
+
+El futuro modulo fiscal podra partir de informacion historica inmutable ya existente en `sale_items`:
+
+- `quantity` / `quantity_base`;
+- `unit_price_snapshot`;
+- `discount_amount`;
+- `tax_snapshot`;
+- `subtotal`;
+- `tax_total`;
+- `total`;
+- snapshots de producto/unidad/SAT.
+
+Tambien podra partir de `returns` / `return_items`:
+
+- cantidades efectivamente devueltas;
+- `refund_amount`;
+- fecha;
+- motivo;
+- relacion con la venta.
+
+Y de `invoices`, cuando exista informacion fiscal relacionada:
+
+- `sale_id`;
+- UUID;
+- `emitter_snapshot`;
+- `receiver_snapshot`;
+- `concepts_snapshot`;
+- `payment_snapshot`;
+- XML/PDF;
+- estado fiscal.
+
+La transaccion fiscal debera construir y persistir sus propios snapshots fiscales autoritativos. No convertir `return_items` en sustituto de esos snapshots fiscales.
+
+`CONFIRMAR DEVOLUCION` no inserta `invoices`, no actualiza `invoices`, no cancela `invoices`, no crea `invoice_events` y no cambia `invoice.status`. Todos esos efectos pertenecen a una futura transaccion fiscal. Esto tambien significa que el `COMMIT` de la devolucion no incluye `invoices`.
+
+`CONFIRMAR DEVOLUCION` no adquiere locks fiscales sobre `invoices` ni `invoice_events`, y no espera respuesta de PAC. La idempotencia de emision/correccion fiscal sera independiente de la idempotencia de `CONFIRM_RETURN`. No reutilizar la misma `idempotency_key` operacional para timbrado.
+
+Cerrar este punto no agrega nuevas columnas fiscales a `returns` o `return_items`. Para `CONFIRMAR DEVOLUCION v0.1`, el unico cambio fisico requerido posterior a db-2 continua siendo:
+
+- `returns.client_operation_id TEXT NOT NULL`;
+- `UNIQUE(branch_id, client_operation_id)`.
+
+Esto no significa que el futuro modulo fiscal no pueda requerir una evolucion de `invoices` o nuevas relaciones. Significa solo que esas decisiones pertenecen al diseno de la transaccion fiscal y no son requisito fisico de `CONFIRMAR DEVOLUCION`.
 
 ## 14. Idempotencia
 
@@ -955,24 +1082,11 @@ Codigos estables propuestos:
 
 No se definen HTTP status codes en este documento.
 
-## 20. Decisiones y gaps pendientes
+## 20. Decisiones/gaps pendientes de CONFIRMAR DEVOLUCION v0.1
 
-Cambio fisico requerido posterior a db-2, ya decidido:
+Ninguna.
 
-- agregar `returns.client_operation_id TEXT NOT NULL`;
-- agregar `UNIQUE(branch_id, client_operation_id)`.
+Cambio fisico requerido antes de implementar, posterior a db-2:
 
-No se agrega `returns.terminal_id` al listado de cambios fisicos requeridos para el MVP. `terminal_id` queda como contexto operativo validado y auditado, no como identidad funcional de la devolucion.
-
-No se agrega `sales.deleted_at`, `sales.deleted_by`, `sales.is_deleted` ni columna equivalente al futuro modelo fisico requerido por este flujo. La preservacion historica de ventas confirmadas se garantiza mediante la politica de no eliminacion fisica en operacion normal.
-
-Decision definitiva sobre reembolsos multiples:
-
-- un unico metodo de reembolso por `returns`;
-- split refund fuera del MVP;
-- no se agrega `return_payments`, `return_refund_payments`, `refund_allocations` ni tabla equivalente;
-- no se requiere cambio fisico por esta decision.
-
-Gaps de diseno que siguen pendientes:
-
-- Desglose fiscal / tratamiento CFDI: `return_items` solo guarda `refund_amount`, no desglose de subtotal, descuento e impuesto devuelto.
+- `returns.client_operation_id TEXT NOT NULL`;
+- `UNIQUE(branch_id, client_operation_id)`.
