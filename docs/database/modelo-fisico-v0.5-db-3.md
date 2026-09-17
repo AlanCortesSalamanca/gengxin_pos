@@ -1,8 +1,10 @@
 # Modelo físico PostgreSQL v0.5-db-3
 
+Estado: VALIDADO / CONGELADO.
+
 Fuente de verdad: `especificacion_maestra_pos_multisucursal_v0.5.md`.
 
-Alcance de esta versión: evolución directa de `v0.5-db-2`, que permanece VALIDADO / CONGELADO para el alcance que tenía en ese momento. `v0.5-db-3` conserva el modelo físico validado de db-2 y agrega únicamente persistencia de `client_operation_id` para devoluciones requerida por `CONFIRMAR DEVOLUCION v0.1`. No define framework backend, frontend ni aplicación de escritorio.
+Alcance de esta versión: evolución directa de `v0.5-db-2`, que permanece VALIDADO / CONGELADO para el alcance que tenía en ese momento. `v0.5-db-3` conserva el modelo físico validado de db-2 y agrega únicamente persistencia de `client_operation_id` para devoluciones requerida por `CONFIRMAR DEVOLUCION v0.1`. `v0.5-db-3` es ahora la versión física validada vigente para el alcance actual. No define framework backend, frontend ni aplicación de escritorio.
 
 Delta único respecto a db-2:
 
@@ -10,6 +12,17 @@ Delta único respecto a db-2:
 - Constraint `uq_returns_client_operation` equivalente a `UNIQUE(branch_id, client_operation_id)`.
 
 Compatibilidad: db-3 mantiene todas las invariantes previas de ventas, cotizaciones, caja, inventario, reposición, pedidos, compras, CFDI, auditoría e idempotencia. El único delta respecto a db-2 es la identidad lógica persistente de `returns`.
+
+Evidencia real de validacion:
+
+- DDL materializado en `database/schema-v0.5-db-3.sql`.
+- Schema ejecutado correctamente en PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) sobre la base temporal `gengxin_pos_db3_test`, con `ON_ERROR_STOP=1`, finalizando en `COMMIT`.
+- Suite de integridad `database/validation-v0.5-db-3.sql` ejecutada correctamente con salida `BEGIN`, `DO`, `ROLLBACK`; el `ROLLBACK` fue intencional.
+- `returns.client_operation_id`: `text`, `NOT NULL`.
+- `uq_returns_client_operation`: `UNIQUE (branch_id, client_operation_id)`.
+- Conteos observados como evidencia complementaria: 51 tablas public/user-defined y 19 enums.
+
+A partir de este punto, `v0.5-db-3` queda VALIDADO / CONGELADO. Cualquier cambio físico posterior debe producir una nueva versión del modelo físico y del schema; no debe editarse silenciosamente db-3.
 
 ## 1. Decisiones generales
 
@@ -425,9 +438,18 @@ Estas reglas requieren leer varias filas, bloquear recursos o coordinar document
 
 ## 9. Archivo DDL
 
-El DDL `database/schema-v0.5-db-3.sql` todavía no se crea en este micro-hito.
+El DDL materializado esta en:
 
-Cuando se materialice, deberá partir de `database/schema-v0.5-db-2.sql` y agregar únicamente `returns.client_operation_id TEXT NOT NULL` con constraint `uq_returns_client_operation` equivalente a `UNIQUE(branch_id, client_operation_id)`.
+`database/schema-v0.5-db-3.sql`
+
+Deriva directamente de `database/schema-v0.5-db-2.sql` y agrega unicamente:
+
+- `returns.client_operation_id TEXT NOT NULL`;
+- `uq_returns_client_operation UNIQUE (branch_id, client_operation_id)`.
+
+Resultado real: ejecutado correctamente en PostgreSQL 17.11 sobre la base temporal `gengxin_pos_db3_test`, con `ON_ERROR_STOP=1`, finalizando en `COMMIT`.
+
+Detalle de ejecucion: `docs/database/ejecucion-schema-v0.5-db-3.md`.
 
 ## 10. Multiempresa
 
@@ -446,6 +468,26 @@ No se refactoriza todo el esquema en db-3 para incluir `business_id` redundante 
 
 ## 11. Validación real
 
-La validación ejecutable de db-3 todavía no se crea en este micro-hito. Cuando exista `database/schema-v0.5-db-3.sql`, deberá validarse contra una base temporal vacía con un archivo de validación db-3 correspondiente.
+El archivo de validacion real es:
 
-En este micro-hito no se ejecuta PostgreSQL.
+`database/validation-v0.5-db-3.sql`
+
+Deriva directamente de `database/validation-v0.5-db-2.sql`, conserva las pruebas previas y agrega validaciones para:
+
+- `NOT NULL` de `returns.client_operation_id`;
+- duplicado en misma branch rechazado;
+- mismo `client_operation_id` permitido en otra branch.
+
+Resultado real observado:
+
+```text
+BEGIN
+DO
+ROLLBACK
+```
+
+No hubo excepcion final de validaciones fallidas. El `ROLLBACK` fue intencional para descartar fixtures temporales.
+
+Comprobacion posterior: `businesses_test_rows = 0`.
+
+Detalle de validacion: `docs/database/validacion-integridad-v0.5-db-3.md`.
