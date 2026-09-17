@@ -254,11 +254,12 @@ No se escribe SQL definitivo en este documento.
 La reserva idempotente ocurre en una transaccion corta dedicada a `idempotency_keys`:
 
 1. Resolver o crear la clave unica `(business_id, operation_type='CONFIRM_RETURN', idempotency_key)`.
-2. Si no existe, crearla con `status='IN_PROGRESS'`, `request_hash`, `locked_until` y `expires_at = NULL`.
-3. Si existe `IN_PROGRESS` con mismo hash y lease vigente, devolver `RETURN_IDEMPOTENCY_IN_PROGRESS`.
-4. Si existe `COMPLETED` con mismo hash, devolver la devolucion ya confirmada desde `result_entity_type='returns'` y `result_entity_id` o `response_body` minima.
-5. Si existe con `request_hash` diferente, devolver `RETURN_IDEMPOTENCY_KEY_REUSED`.
-6. Si existe `FAILED` con mismo hash, devolver el error de dominio almacenado.
+2. Si no existe, crearla con `status='IN_PROGRESS'`, `request_hash` canonico, `locked_until = now() + 30 segundos` y `expires_at = NULL`.
+3. Si existe con `request_hash` diferente, devolver `RETURN_IDEMPOTENCY_KEY_REUSED`, sin importar si esta `IN_PROGRESS`, `COMPLETED` o `FAILED`.
+4. Si existe `IN_PROGRESS` con mismo hash y `locked_until > now()`, devolver `RETURN_IDEMPOTENCY_IN_PROGRESS`; no mantener la peticion HTTP esperando 30 segundos.
+5. Si existe `IN_PROGRESS` con mismo hash y `locked_until <= now()`, primero comprobar `returns(branch_id, client_operation_id)`: si ya existe, no repetir efectos y reconciliar hacia `COMPLETED`; si no existe, puede recuperarse solo si `result_entity_id IS NULL` y la fila puede adquirirse sin competir con una ejecucion activa; al recuperar, actualizar `locked_until = now() + 30 segundos` y continuar.
+6. Si existe `COMPLETED` con mismo hash, no crear otra devolucion y devolver la devolucion ya confirmada desde `result_entity_type='returns'` y `result_entity_id` o `response_body` minima.
+7. Si existe `FAILED` con mismo hash, devolver el error de dominio almacenado sin reintentar automaticamente esa misma clave.
 
 ### FASE B - Confirmar devolucion transaccional
 
@@ -292,7 +293,7 @@ Dentro de un unico `BEGIN` / `COMMIT` operativo:
 26. Recalcular cantidades devueltas acumuladas por venta y actualizar `sales.status` a `PARTIALLY_RETURNED` o `RETURNED` segun corresponda.
 27. Si `refund_amount > 0` y el metodo afecta caja, insertar un unico `cash_movements` tipo `RETURN_CASH` con `amount_delta = -returns.refund_amount` y referencia a `returns`.
 28. Insertar `audit_log` con `action='RETURN_CONFIRMED'`.
-29. Marcar `idempotency_keys` como `COMPLETED`, con `result_entity_type='returns'`, `result_entity_id=returns.id`, `response_body` minima, errores nulos, `locked_until=NULL` y `expires_at` definido.
+29. Marcar `idempotency_keys` como `COMPLETED`, con `result_entity_type='returns'`, `result_entity_id=returns.id`, `response_body` minima, `error_code=NULL`, `error_message=NULL`, `locked_until=NULL` y `expires_at = now() + 30 dias`.
 
 ### Reconciliacion por devolucion existente
 
@@ -310,7 +311,7 @@ Si FASE B encuentra una devolucion existente para `(branch_id, client_operation_
 10. Reconciliar la `idempotency_key` actual hacia `COMPLETED`.
 11. Usar `result_entity_type='returns'` y `result_entity_id=returns.id`.
 12. Guardar `response_body` minima.
-13. Establecer `locked_until = NULL` y `expires_at` segun politica de retencion.
+13. Establecer `locked_until = NULL` y `expires_at = now() + 30 dias`.
 14. Devolver la devolucion existente.
 
 ### FASE C - Fallo de dominio deterministico
@@ -321,7 +322,7 @@ Si FASE B falla por error de dominio deterministico:
 2. Abrir una transaccion corta sin escrituras de negocio.
 3. Bloquear `idempotency_keys`.
 4. Verificar que `request_hash` coincida.
-5. Guardar `status='FAILED'`, `error_code`, `error_message` seguro, `locked_until=NULL` y `expires_at`.
+5. Guardar `status='FAILED'`, `error_code`, `error_message` seguro, `locked_until=NULL` y `expires_at = now() + 30 dias`.
 6. Hacer `COMMIT`.
 
 No se guardan stack traces, SQL interno, secretos ni datos sensibles.
@@ -897,6 +898,41 @@ El metodo de reembolso forma parte del payload canonico que contribuye a `reques
 
 Para MVP no es necesario guardar otro payload hash en `returns`, porque `request_hash` ya vive en `idempotency_keys`. No se define todavia fingerprint adicional sobre `returns`.
 
+### Lifecycle de `idempotency_key`
+
+Valores definitivos para MVP:
+
+- lease `IN_PROGRESS`: `locked_until = now() + 30 segundos`;
+- retencion `COMPLETED`: `expires_at = now() + 30 dias`;
+- retencion `FAILED`: `expires_at = now() + 30 dias`;
+- `IN_PROGRESS`: `expires_at = NULL`;
+- `locked_until` controla exclusivamente el lease de ejecucion.
+
+Si no existe la clave, se crea con `operation_type='CONFIRM_RETURN'`, `status='IN_PROGRESS'`, `request_hash` canonico, `locked_until = now() + 30 segundos` y `expires_at = NULL`.
+
+Si existe con `request_hash` diferente, devolver `RETURN_IDEMPOTENCY_KEY_REUSED`. Esto aplica independientemente de que la fila este `IN_PROGRESS`, `COMPLETED` o `FAILED`.
+
+Si existe `IN_PROGRESS` con mismo hash y `locked_until > now()`, devolver `RETURN_IDEMPOTENCY_IN_PROGRESS`. No mantener una peticion HTTP esperando los 30 segundos; el POS podra reintentar posteriormente. Si otra transaccion todavia mantiene efectivamente bloqueada la fila, tratar la ejecucion como todavia `IN_PROGRESS`.
+
+Si existe `IN_PROGRESS` con mismo hash y `locked_until <= now()`, la clave solo puede recuperarse si:
+
+- `request_hash` coincide;
+- `result_entity_id IS NULL`;
+- no existe ya `returns(branch_id, client_operation_id)`;
+- la fila puede adquirirse sin competir con una ejecucion activa.
+
+Si se recupera, renovar `locked_until = now() + 30 segundos` y continuar. La expiracion del tiempo por si sola no autoriza ejecutar una segunda devolucion mientras una operacion previa siga activa.
+
+Si durante la recuperacion ya existe `returns(branch_id, client_operation_id)`, no repetir efectos: reconciliar la `idempotency_key` hacia `COMPLETED` con `result_entity_type='returns'`, `result_entity_id=returns.id`, `response_body` minima, `locked_until=NULL` y `expires_at = now() + 30 dias`.
+
+Si existe `COMPLETED` con mismo hash, no crear otra devolucion; devolver `response_body` minima o reconstruir desde `result_entity_type='returns'` y `result_entity_id`.
+
+Si existe `FAILED` con mismo hash, devolver el mismo error de dominio almacenado y no reintentar automaticamente esa misma clave. Si el usuario corrige la devolucion, puede conservar `client_operation_id` solo si todavia no existe una fila `returns` para esa operacion logica, pero debe usar nueva `idempotency_key` y nuevo `request_hash`.
+
+Persistir `FAILED` unicamente para errores de dominio deterministicos. Para fallos tecnicos no deterministicos, como caida del proceso, perdida de conexion, timeout interno o error inesperado con resultado desconocido, no marcar automaticamente `FAILED`. La clave puede permanecer `IN_PROGRESS` hasta que expire `locked_until`; despues se aplica recuperacion segura. Antes de repetir efectos debe comprobarse `returns(branch_id, client_operation_id)`: si ya existe, reconciliar hacia `COMPLETED`; si no existe y se cumplen las condiciones de recuperacion, renovar `locked_until = now() + 30 segundos` y continuar.
+
+Una futura tarea de limpieza podra eliminar filas expiradas si no estan asociadas a una operacion activa. No se crea esa tarea aqui.
+
 ### Advisory lock
 
 Mantener transaction advisory lock por `(branch_id, client_operation_id)`. Su funcion es cerrar la ventana concurrente antes de que exista la fila `returns`.
@@ -912,7 +948,7 @@ Flujo conceptual futuro:
 
 No se fija hash ni SQL concreto del advisory lock.
 
-`response_body` debe ser minima, por ejemplo:
+`response_body` debe ser deliberadamente pequena, con limite logico de aplicacion de 16 KiB. Ejemplo minimo:
 
 - `return_public_id`;
 - `folio`;
@@ -920,7 +956,7 @@ No se fija hash ni SQL concreto del advisory lock.
 - `refund_amount`;
 - `confirmed_at`.
 
-No guardar ticket completo, XML, PDF, secretos ni datos innecesarios en `idempotency_keys.response_body`.
+No guardar tickets completos, XML, PDF, imagenes, secretos ni payloads completos innecesarios en `idempotency_keys.response_body`. Esto no requiere cambio de schema.
 
 ## 15. Folio
 
@@ -1012,7 +1048,7 @@ Si ocurre `ROLLBACK`, tambien se revierte el cambio de `sales.status`, el increm
 
 Nunca debe quedar el promedio recalculado sin la devolucion confirmada correspondiente.
 
-La FASE A puede dejar `idempotency_keys.status='IN_PROGRESS'` como lease persistente. Si FASE B falla por dominio deterministico, FASE C puede marcar `FAILED` en una transaccion corta sin escrituras de negocio.
+La FASE A puede dejar `idempotency_keys.status='IN_PROGRESS'` con `locked_until = now() + 30 segundos` y `expires_at = NULL`. Si FASE B falla por dominio deterministico, FASE C puede marcar `FAILED` en una transaccion corta sin escrituras de negocio, con `expires_at = now() + 30 dias`. Los fallos tecnicos no deterministicos no se marcan automaticamente `FAILED`.
 
 ## 18. Concurrencia
 
@@ -1024,7 +1060,7 @@ Resultado esperado: solo uno confirma esa ultima cantidad.
 
 ### B. Doble clic en confirmar devolucion
 
-Si ambos intentos usan la misma `idempotency_key` y el mismo `client_operation_id`, `idempotency_keys` protege el mismo request. El primero reserva la clave y ejecuta. El segundo recibe `RETURN_IDEMPOTENCY_IN_PROGRESS` mientras esta en curso o la devolucion ya confirmada cuando la clave queda `COMPLETED`.
+Si ambos intentos usan la misma `idempotency_key` y el mismo `client_operation_id`, `idempotency_keys` protege el mismo request. El primero reserva la clave con lease de 30 segundos y ejecuta. El segundo recibe `RETURN_IDEMPOTENCY_IN_PROGRESS` mientras esta en curso o la devolucion ya confirmada cuando la clave queda `COMPLETED`.
 
 Si accidentalmente llega el mismo `client_operation_id` con otra `idempotency_key`, el advisory lock protege la creacion concurrente y la unicidad futura `UNIQUE(branch_id, client_operation_id)` sera la defensa persistente final. Si ya existe la devolucion, se devuelve/reconcilia; no se crea otra.
 
