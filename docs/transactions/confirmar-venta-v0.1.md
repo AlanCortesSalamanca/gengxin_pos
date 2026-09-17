@@ -286,7 +286,7 @@ Al inicio de FASE B:
 
 1. Bloquear la fila `idempotency_keys` correspondiente.
 2. Comprobar nuevamente `status`, `request_hash` y lease/propiedad de la ejecución.
-3. Continuar con advisory lock de `client_operation_id`, autorización, caja, cotización, catálogos, inventario, reposición, folio, venta, pagos, caja, auditoría y efectos operativos.
+3. Continuar con advisory lock de `client_operation_id`, autorización, cotización, caja, catálogos, inventario, reposición, folio, venta, pagos, caja, auditoría y efectos operativos.
 
 Al final de la misma transacción operativa, actualizar `idempotency_keys`:
 
@@ -384,8 +384,8 @@ Nota crítica: el folio se bloquea después de revalidar inventario para no mant
 3. Adquirir advisory lock determinista por `(branch_id, client_operation_id)`.
 4. Verificar venta previa por `sales(branch_id, client_operation_id)`; si existe, no ejecutar efectos de negocio nuevamente, reconciliar idempotencia hacia `COMPLETED` y devolver la venta existente.
 5. Validar `branch`, `terminal`, `user`, permisos y pertenencia a sucursal.
-6. Bloquear y validar `cash_session` abierta de la misma sucursal y terminal.
-7. Bloquear y validar cotización si aplica.
+6. Bloquear y validar cotización si aplica.
+7. Bloquear y validar `cash_session` abierta de la misma sucursal y terminal.
 8. Resolver y validar cliente, lista de precios, productos, unidades, precios, descuentos e impuestos.
 9. Resolver métodos de pago y `replenishment_channel`.
 10. Rechazar mezcla de canales `CASH` / `TRANSFER` para MVP.
