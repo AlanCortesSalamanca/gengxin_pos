@@ -2,16 +2,16 @@
 
 Fuente funcional: `especificacion_maestra_pos_multisucursal_v0.5.md`.
 
-Referencia fisica: `docs/database/modelo-fisico-v0.5-db-2.md` y `database/schema-v0.5-db-2.sql` validado en PostgreSQL 17.11.
+Referencia fisica vigente: `docs/database/modelo-fisico-v0.5-db-3.md` y `database/schema-v0.5-db-3.sql` validado en PostgreSQL 17.11. PostgreSQL v0.5-db-3 es la referencia fisica vigente de `CONFIRMAR DEVOLUCION v0.1`.
 
 Este documento disena conceptualmente la transaccion `CONFIRMAR DEVOLUCION`. No define framework, API, DTOs, endpoints, servicios, repositorios, frontend, backend ni stack de aplicacion.
 
 ## Estado del diseno
 
-- Estado: DISENO FUNCIONAL CERRADO / PENDIENTE DE EVOLUCION FISICA
+- Estado: DISENO FUNCIONAL CERRADO / EVOLUCION FISICA VALIDADA
 - Version: v0.1
 - Compatible funcionalmente con especificacion maestra v0.5
-- Requiere evolucion fisica posterior a PostgreSQL v0.5-db-2 para `returns.client_operation_id`
+- Compatible con modelo fisico PostgreSQL v0.5-db-3; la evolucion fisica requerida ya fue realizada.
 - Implementacion: todavia no iniciada
 
 Cualquier validacion contra este documento debe considerar que `CONFIRMAR VENTA v0.1` permanece VALIDADO / CONGELADO y no se modifica aqui.
@@ -61,11 +61,11 @@ Cada `disposition` debe ser una de:
 
 No se fija DTO ni API. El payload canonico exacto queda fuera de este documento.
 
-## 3. Verificacion real contra db-2
+## 3. Verificacion real contra db-3
 
-Tablas y columnas verificadas en `database/schema-v0.5-db-2.sql`:
+Tablas y columnas verificadas en `database/schema-v0.5-db-3.sql`:
 
-- `returns`: `id`, `public_id`, `branch_id`, `sale_id`, `cash_session_id`, `created_by_user_id`, `confirmed_by_user_id`, `folio`, `status`, `reason`, `refund_amount`, `refund_payment_method_id`, `confirmed_at`, `created_at`, `updated_at`.
+- `returns`: `id`, `public_id`, `branch_id`, `sale_id`, `cash_session_id`, `created_by_user_id`, `confirmed_by_user_id`, `folio`, `status`, `reason`, `refund_amount`, `refund_payment_method_id`, `client_operation_id`, `confirmed_at`, `created_at`, `updated_at`.
 - `return_items`: `id`, `return_id`, `sale_id`, `sale_item_id`, `disposition`, `quantity_base`, `refund_amount`, `reason`, `created_at`.
 - `sales`: `id`, `public_id`, `branch_id`, `terminal_id`, `cash_session_id`, `user_id`, `customer_id`, `price_list_id`, `folio`, `status`, `replenishment_channel`, snapshots, totales, `currency`, `client_operation_id`, `confirmed_at`, `created_at`.
 - `sale_items`: `id`, `sale_id`, `line_number`, `product_id`, `product_unit_id`, snapshots comerciales y SAT, `factor_to_base_snapshot`, `quantity`, `quantity_base`, `unit_price_snapshot`, `discount_amount`, `tax_snapshot`, `unit_cost_snapshot`, `subtotal`, `tax_total`, `total`, `created_at`.
@@ -80,21 +80,21 @@ Tablas y columnas verificadas en `database/schema-v0.5-db-2.sql`:
 - `idempotency_keys`: `business_id`, `branch_id`, `operation_type`, `idempotency_key`, `request_hash`, `status`, resultado, `response_body`, error, `locked_until`, `expires_at`.
 - `audit_log`: `actor_user_id`, `branch_id`, `terminal_id`, `action`, `entity_type`, `entity_id`, `entity_public_id`, `before_data`, `after_data`, `context`, red y timestamps.
 
-Observaciones fisicas relevantes contra db-2:
+Observaciones fisicas relevantes contra db-3:
 
 - `returns` no tiene `request_hash`; el hash vive en `idempotency_keys`.
 - `return_items` no tiene columnas separadas de subtotal, descuento, impuesto o costo; para `CONFIRMAR DEVOLUCION v0.1` no se requieren porque la devolucion operativa no sustituye al documento fiscal.
 
-Decision fisica para `DAMAGED`: db-2 no modela inventario no vendible, cuarentena ni almacen de danados; para el MVP no se requiere modelarlo porque `DAMAGED` se trata como merma inmediata fuera del inventario operativo controlado por el POS.
+Decision fisica para `DAMAGED`: db-3 no modela inventario no vendible, cuarentena ni almacen de danados; para el MVP no se requiere modelarlo porque `DAMAGED` se trata como merma inmediata fuera del inventario operativo controlado por el POS.
 
-Decision fisica para reembolsos: db-2 ya soporta la politica MVP de un unico metodo por devolucion mediante `returns.refund_amount` y `returns.refund_payment_method_id`. No se requiere `return_payments`, `return_refund_payments`, `refund_allocations` ni tabla equivalente.
+Decision fisica para reembolsos: db-3 soporta la politica MVP de un unico metodo por devolucion mediante `returns.refund_amount` y `returns.refund_payment_method_id`. No se requiere `return_payments`, `return_refund_payments`, `refund_allocations` ni tabla equivalente.
 
-Cambio fisico requerido posterior a db-2:
+Evolucion fisica materializada y validada en db-3:
 
-- agregar `returns.client_operation_id TEXT NOT NULL`;
-- agregar unicidad conceptual `UNIQUE(branch_id, client_operation_id)`.
+- `returns.client_operation_id TEXT NOT NULL`;
+- `CONSTRAINT uq_returns_client_operation UNIQUE (branch_id, client_operation_id)`.
 
-Esta decision ya queda cerrada para el diseno transaccional, pero no se modifica db-2. db-2 permanece congelado como version validada. No se crea db-3 ni migracion en este micro-hito; la evolucion fisica se hara posteriormente en un hito separado.
+`schema-v0.5-db-3.sql` ejecuto correctamente, `validation-v0.5-db-3.sql` paso y db-3 quedo VALIDADO / CONGELADO como modelo fisico. db-2 permanece como version historica de origen para explicar la evolucion.
 
 Decision definitiva sobre `terminal_id` para MVP:
 
@@ -125,7 +125,7 @@ No se modifica schema en este documento.
 - El usuario pertenece a la sucursal mediante `user_branches(user_id, branch_id)`.
 - El usuario tiene permiso funcional `RETURNS_CONFIRM` mediante `permissions.code`, roles activos y `role_permissions`.
 - La venta `sale_id` existe, pertenece a la misma `branch_id` para el MVP y pertenece al mismo `business_id` via sucursal.
-- La venta original esta en estado compatible para devolucion. En db-2 los estados disponibles son `CONFIRMED`, `PARTIALLY_RETURNED`, `RETURNED` y `CANCELLED`; para el MVP son retornables `CONFIRMED` y `PARTIALLY_RETURNED`.
+- La venta original esta en estado compatible para devolucion. En db-3 los estados disponibles son `CONFIRMED`, `PARTIALLY_RETURNED`, `RETURNED` y `CANCELLED`; para el MVP son retornables `CONFIRMED` y `PARTIALLY_RETURNED`.
 - Una venta `RETURNED` no es retornable.
 - Una venta `CANCELLED` no es retornable; `CANCELLED` no significa borrado fisico.
 - Una venta ya completamente retornada por suma de `return_items` confirmados no es retornable, incluso si el estado materializado estuviera desfasado por un fallo previo a detectar.
@@ -223,7 +223,7 @@ Orden determinista:
 
 1. `idempotency_keys` por `(business_id, operation_type='CONFIRM_RETURN', idempotency_key)`.
 2. Transaction advisory lock por `(branch_id, client_operation_id)` de la devolucion.
-3. Busqueda de `returns(branch_id, client_operation_id)` existente, cuando el modelo fisico futuro incluya esa columna.
+3. Busqueda de `returns(branch_id, client_operation_id)` existente.
 4. `sales` por `sale_id`.
 5. `sale_items` originales seleccionados, filtrados por `sale_id`, en orden ascendente de `sale_items.id`.
 6. `returns` confirmadas previas de la misma venta o consulta bloqueante equivalente de filas relevantes ya existentes.
@@ -238,7 +238,7 @@ Justificacion critica:
 
 - `idempotency_keys` evita doble ejecucion de la misma solicitud.
 - El advisory lock de `client_operation_id` cierra la ventana concurrente antes de que exista la fila `returns`; no es necesario row-lockear una fila inexistente.
-- La unicidad futura `UNIQUE(branch_id, client_operation_id)` en `returns` queda como defensa final persistente de PostgreSQL.
+- La unicidad `UNIQUE(branch_id, client_operation_id)` en `returns` queda como defensa final persistente de PostgreSQL.
 - Bloquear `sales` serializa devoluciones que compiten por la misma venta y permite actualizar `sales.status` de forma determinista.
 - Bloquear `sale_items` relevantes serializa el calculo de cantidades retornables por linea.
 - Bloquear filas previas de `returns` y `return_items` ayuda a obtener una vista estable de devoluciones ya confirmadas existentes, pero no basta si no existen filas previas; por eso el lock de `sales` y `sale_items` es el lock principal de serializacion.
@@ -267,7 +267,7 @@ Dentro de un unico `BEGIN` / `COMMIT` operativo:
 
 1. Bloquear y verificar la fila `idempotency_keys` reservada.
 2. Adquirir advisory lock determinista por `(branch_id, client_operation_id)`.
-3. Buscar `returns(branch_id, client_operation_id)` existente, cuando la evolucion fisica futura este disponible.
+3. Buscar `returns(branch_id, client_operation_id)` existente.
 4. Si existe, no ejecutar efectos de negocio nuevamente; reconciliar la `idempotency_key` actual hacia `COMPLETED` y devolver la devolucion existente.
 5. Si no existe, continuar.
 6. Validar `branch`, `terminal`, `user`, permiso `RETURNS_CONFIRM` y pertenencia a sucursal.
@@ -283,7 +283,7 @@ Dentro de un unico `BEGIN` / `COMMIT` operativo:
 16. Bloquear o preparar `replenishment_positions` para productos/canal con lineas `RESTOCK`.
 17. Bloquear `document_sequences` de `DEV` para la sucursal.
 18. Reservar folio `DEV` incrementando `next_number` dentro de la misma transaccion.
-19. Insertar `returns` con `status='CONFIRMED'`, folio, venta, usuario, motivo, metodo unico cuando aplique, importe total y `client_operation_id` cuando la evolucion fisica exista.
+19. Insertar `returns` con `status='CONFIRMED'`, folio, venta, usuario, motivo, metodo unico cuando aplique, importe total y `client_operation_id`.
 20. Insertar `return_items` con cantidades, disposicion, motivo por linea si aplica e importes.
 21. Para lineas `RESTOCK`, actualizar `inventory_balances.quantity_base`, recalcular `average_cost_base` por promedio ponderado, incrementar `version` e insertar `inventory_movements` tipo `SALE_RETURN` con delta positivo.
 22. Para lineas `DAMAGED`, no incrementar inventario vendible, no crear `SALE_RETURN` ni crear otro `inventory_movement`.
@@ -475,12 +475,12 @@ Efectos conceptuales:
 
 La venta original ya desconto la unidad del inventario vendible. Al regresar como `DAMAGED`, no debe reincorporarse a ese mismo saldo. Crear `inventory_movements.movement_type = 'SALE_RETURN'` implicaria una entrada positiva y exigiria coherencia con `inventory_balances.quantity_base`; como la unidad no vuelve al stock vendible, no se debe crear `SALE_RETURN`.
 
-Tampoco se inventa otro `movement_type` en este hito. Para `CONFIRMAR DEVOLUCION v0.1`, el unico cambio fisico requerido posterior a db-2 sigue siendo:
+Tampoco se inventa otro `movement_type` en este hito. db-3 ya incorporo el unico delta fisico requerido por `CONFIRMAR DEVOLUCION v0.1`:
 
 - `returns.client_operation_id TEXT NOT NULL`;
-- `UNIQUE(branch_id, client_operation_id)`.
+- `CONSTRAINT uq_returns_client_operation UNIQUE (branch_id, client_operation_id)`.
 
-No agregar al futuro modelo fisico requerido por este flujo:
+No agregar al modelo fisico requerido por este flujo:
 
 - `damaged_inventory`;
 - `quarantine_inventory`;
@@ -593,7 +593,7 @@ No dividir una misma devolucion entre:
 - dos transferencias;
 - dos metodos cualesquiera.
 
-No crear tabla `return_payments`, `return_refund_payments`, `refund_allocations` ni tabla equivalente para MVP. La decision usa directamente el modelo existente `returns.refund_amount` y `returns.refund_payment_method_id`; por tanto no requiere cambio fisico posterior a db-2.
+No crear tabla `return_payments`, `return_refund_payments`, `refund_allocations` ni tabla equivalente para MVP. La decision usa directamente el modelo existente `returns.refund_amount` y `returns.refund_payment_method_id`; por tanto no requirio cambios adicionales en db-3.
 
 Si `returns.refund_amount > 0`:
 
@@ -824,10 +824,10 @@ La transaccion fiscal debera construir y persistir sus propios snapshots fiscale
 
 `CONFIRMAR DEVOLUCION` no adquiere locks fiscales sobre `invoices` ni `invoice_events`, y no espera respuesta de PAC. La idempotencia de emision/correccion fiscal sera independiente de la idempotencia de `CONFIRM_RETURN`. No reutilizar la misma `idempotency_key` operacional para timbrado.
 
-Cerrar este punto no agrega nuevas columnas fiscales a `returns` o `return_items`. Para `CONFIRMAR DEVOLUCION v0.1`, el unico cambio fisico requerido posterior a db-2 continua siendo:
+Cerrar este punto no agrega nuevas columnas fiscales a `returns` o `return_items`. El unico delta fisico requerido por `CONFIRMAR DEVOLUCION v0.1` ya fue materializado en db-3:
 
 - `returns.client_operation_id TEXT NOT NULL`;
-- `UNIQUE(branch_id, client_operation_id)`.
+- `CONSTRAINT uq_returns_client_operation UNIQUE (branch_id, client_operation_id)`.
 
 Esto no significa que el futuro modulo fiscal no pueda requerir una evolucion de `invoices` o nuevas relaciones. Significa solo que esas decisiones pertenecen al diseno de la transaccion fiscal y no son requisito fisico de `CONFIRMAR DEVOLUCION`.
 
@@ -837,7 +837,7 @@ La devolucion debe ser idempotente.
 
 Decision definitiva: `CONFIRMAR DEVOLUCION` requiere persistir `client_operation_id` en `returns` para tener idempotencia robusta equivalente al flujo de ventas.
 
-Cambio fisico requerido en una evolucion posterior a db-2:
+Persistencia fisica disponible en db-3:
 
 - `returns.client_operation_id TEXT NOT NULL`;
 - `UNIQUE(branch_id, client_operation_id)`.
@@ -856,9 +856,9 @@ Caso que debe evitarse:
 - la devolucion queda confirmada;
 - luego llega accidentalmente `branch_id = B`, `client_operation_id = X`, `idempotency_key = K2`.
 
-Sin persistir `client_operation_id` en `returns`, db-2 no puede saber de forma autoritativa que `X` ya produjo una devolucion. Eso podria intentar repetir reembolso, entrada `RESTOCK`, movimientos, reposicion, folio y actualizacion de `sales.status`.
+Historicamente, sin persistir `client_operation_id` en `returns`, db-2 no podia saber de forma autoritativa que `X` ya produjo una devolucion. Eso podia intentar repetir reembolso, entrada `RESTOCK`, movimientos, reposicion, folio y actualizacion de `sales.status`; db-3 resuelve esa limitacion con persistencia y unicidad.
 
-Por tanto se requiere una defensa persistente secundaria.
+Por tanto se mantiene una defensa persistente secundaria.
 
 ### Contrato de `client_operation_id`
 
@@ -1062,7 +1062,7 @@ Resultado esperado: solo uno confirma esa ultima cantidad.
 
 Si ambos intentos usan la misma `idempotency_key` y el mismo `client_operation_id`, `idempotency_keys` protege el mismo request. El primero reserva la clave con lease de 30 segundos y ejecuta. El segundo recibe `RETURN_IDEMPOTENCY_IN_PROGRESS` mientras esta en curso o la devolucion ya confirmada cuando la clave queda `COMPLETED`.
 
-Si accidentalmente llega el mismo `client_operation_id` con otra `idempotency_key`, el advisory lock protege la creacion concurrente y la unicidad futura `UNIQUE(branch_id, client_operation_id)` sera la defensa persistente final. Si ya existe la devolucion, se devuelve/reconcilia; no se crea otra.
+Si accidentalmente llega el mismo `client_operation_id` con otra `idempotency_key`, el advisory lock protege la creacion concurrente y la unicidad `UNIQUE(branch_id, client_operation_id)` es la defensa persistente final. Si ya existe la devolucion, se devuelve/reconcilia; no se crea otra.
 
 Resultado esperado: una sola devolucion.
 
@@ -1122,7 +1122,7 @@ No se definen HTTP status codes en este documento.
 
 Ninguna.
 
-Cambio fisico requerido antes de implementar, posterior a db-2:
+No quedan cambios fisicos pendientes antes de implementar para este contrato. db-3 ya materializo:
 
 - `returns.client_operation_id TEXT NOT NULL`;
-- `UNIQUE(branch_id, client_operation_id)`.
+- `CONSTRAINT uq_returns_client_operation UNIQUE (branch_id, client_operation_id)`.
