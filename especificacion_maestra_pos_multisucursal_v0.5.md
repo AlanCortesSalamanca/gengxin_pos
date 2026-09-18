@@ -943,6 +943,8 @@ extra_planned = MAX(cantidad_total_deseada - replenishment_planned, 0)
 
 El excedente no queda implícito. Debe persistirse explícitamente como `customer_special_qty_base` o `stock_extra_qty_base`, según su motivo real.
 
+La disponibilidad agregada (`available_to_order_base`) proviene de `replenishment_positions` y funciona como límite operacional agregado. La trazabilidad FIFO proviene de la suma todavía reservable de `sale_items` elegibles del mismo branch, producto y canal (`total_sale_item_reservable`). La porción persistida como `replenishment_qty_base` solo puede confirmarse si cabe completamente en ambos límites.
+
 | **Pendiente disponible al editar** | **Cantidad total deseada** | **replenishment_qty_base persistido** | **extra/customer_special persistido** | **Pendiente disponible si se confirma sin cambios concurrentes** |
 |------------------------------------|----------------------------|--------------------------------------|--------------------------------------|------------------------------------------------------------------|
 | 10                                 | 10                         | 10                                   | 0                                    | 0                                                                |
@@ -962,7 +964,8 @@ replenishment_planned = MIN(cantidad_total_deseada, pendiente_disponible_al_edit
 extra_planned = MAX(cantidad_total_deseada - replenishment_planned, 0)<br />
 <br />
 Durante confirmación:<br />
-replenishment_reserved = replenishment_qty_base persistido solo si replenishment_qty_base &lt;= available_to_order_base actual bajo lock</th>
+confirmable_cap = LEAST(available_to_order_base, total_sale_item_reservable)<br />
+replenishment_reserved = replenishment_qty_base persistido solo si replenishment_qty_base &lt;= confirmable_cap</th>
 </tr>
 </thead>
 <tbody>
@@ -981,6 +984,12 @@ Pedido especial grande: hay 10 módulos pendientes de reposición y el usuario d
 
 **Cambio concurrente de reposición:** El DRAFT fue revisado con `replenishment_qty_base = 10` y `available_to_order_base = 10`. Antes de confirmar, otra operación modifica la demanda y ahora `available_to_order_base = 6`. En ese caso CONFIRMAR PEDIDO debe rechazar la confirmación, no reservar parcialmente 6, no tratar automáticamente 4 como `stock_extra`, no reescribir `purchase_order_items` y exigir refrescar/revisar/editar el DRAFT. El motivo es que `purchase_order_items` conserva el motivo histórico de la cantidad solicitada y la confirmación no debe alterarlo silenciosamente.
 
+**Agregado mayor que FIFO trazable:** Si `available_to_order_base = 10`, `total_sale_item_reservable = 6` y el DRAFT tiene `replenishment_qty_base = 10`, no se confirma. Aunque el agregado permita 10, solo 6 pueden materializarse con trazabilidad FIFO. No se crean allocations parciales por 6, no se incrementa `committed_qty_base` y no se genera `ORDER_RESERVE`.
+
+**Agregado menor que FIFO trazable:** Si `available_to_order_base = 6`, `total_sale_item_reservable = 10` y el DRAFT tiene `replenishment_qty_base = 10`, no se confirma. La posición agregada sigue siendo límite autoritativo aunque existan `sale_items` que conceptualmente parezcan reservables. Esta divergencia puede provenir de una corrección autorizada u otra evolución del estado agregado y no se trata automáticamente como corrupción.
+
+`confirmable_cap = LEAST(available_to_order_base, total_sale_item_reservable)` es un límite de validación, no una autorización para reservar silenciosamente una cantidad menor. Si `replenishment_qty_base` excede `confirmable_cap`, el DRAFT se rechaza como obsoleto y debe revisarse.
+
 ## 14.4.1 Motivo de la cantidad pedida
 
 Cada línea puede separar su cantidad planeada en tres motivos para conservar el porqué de la compra.
@@ -994,6 +1003,8 @@ Cada línea puede separar su cantidad planeada en tres motivos para conservar el
 ## 14.5 Asignación FIFO
 
 Para mantener trazabilidad por venta, las cantidades reservadas/cubiertas se asignan internamente en orden FIFO a sale_items del mismo producto, sucursal y canal de reposición. Nunca se cruza FIFO entre EFECTIVO y TRANSFERENCIA. El usuario no necesita ver ese detalle; solo ve totales pendientes por canal.
+
+Toda cantidad confirmada como reposición debe poder asignarse íntegramente a `sale_items` trazables mediante FIFO. En v0.1 no existe reposición confirmada sin trazabilidad FIFO materializable.
 
 <table>
 <colgroup>
@@ -1037,9 +1048,15 @@ La sugerencia de pedido no dependerá únicamente de comparar columnas de sale_i
 | ORDER_RESERVE     | Reserva parte del pendiente para un pedido confirmado; no lo considera cubierto todavía. |
 | ORDER_RELEASE     | Libera reserva por cancelación o por faltante al cerrar la compra.                       |
 | PURCHASE_FULFILL  | Marca como cubierta la demanda con cantidad realmente recibida del mismo canal.          |
-| MANUAL_CORRECTION | Solo para correcciones excepcionales autorizadas/auditadas.                              |
+| MANUAL_CORRECTION | Corrección excepcional autorizada/auditada del agregado; no crea demanda comercial nueva ni demanda reservable independiente. |
 
 - Las asignaciones FIFO se conservan para saber qué demanda fue reservada/cubierta, pero el usuario opera con totales agregados.
+
+`MANUAL_CORRECTION` puede corregir/reconciliar `replenishment_positions` para reflejar la realidad operativa trazable. Una corrección positiva o negativa del agregado no crea por sí sola `sale_item`, `replenishment_allocation`, demanda FIFO nueva ni derecho automático a reservar en un pedido.
+
+Si el negocio desea comprar unidades que no corresponden a demanda pendiente trazable de una venta/`sale_item`, esas unidades no deben representarse creando demanda mediante `MANUAL_CORRECTION`. Deben clasificarse en el DRAFT como `stock_extra_qty_base` o `customer_special_qty_base`, según el motivo real.
+
+Estas reglas no requieren columna nueva, constraint nuevo, trigger nuevo, índice obligatorio para correctitud ni db-4. Un índice futuro para optimizar FIFO sería una decisión de performance, no condición de correctitud funcional.
 
 # 15. Compra / recepción
 
@@ -1505,6 +1522,10 @@ quote_items: id, quote_id, product_id, description_snapshot, unit_snapshot/unit_
 - RB-63. Cancelar o vencer una cotización no genera movimientos compensatorios porque nunca produjo efectos operativos.
 
 - RB-64. Un pedido a proveedor puede permanecer vacío mientras está en DRAFT, pero no puede confirmarse sin al menos una línea de pedido válida.
+
+- RB-65. `MANUAL_CORRECTION` solo corrige/reconcilia el agregado de reposición; no crea por sí misma demanda comercial reservable. Una compra sin demanda trazable de `sale_item` debe clasificarse como stock extra o pedido especial.
+
+- RB-66. La porción de reposición de un pedido solo puede confirmarse si cabe íntegramente tanto en `available_to_order_base` como en la demanda FIFO reservable trazable por `sale_item`; si cualquiera no alcanza, se rechaza sin reserva parcial ni reclasificación automática.
 
 # 21. Validaciones y casos límite
 
