@@ -74,6 +74,74 @@ El request de confirmacion no incluye las lineas del pedido como autoridad.
 
 No se define algoritmo criptografico en este documento.
 
+## 3.1. AUTORIZACION DE CONFIRMAR PEDIDO A PROVEEDOR
+
+Permiso funcional definitivo MVP:
+
+```text
+PURCHASE_ORDERS_CONFIRM
+```
+
+Se mantiene la convencion conceptual `<MODULE>_<ACTION>`, consistente con permisos como `SALES_CONFIRM` y `RETURNS_CONFIRM`.
+
+No usar nombres de rol como autorizacion.
+
+Modelo de autorizacion existente:
+
+- `users`;
+- `user_roles`;
+- `roles`;
+- `role_permissions`;
+- `permissions`;
+- `user_branches`.
+
+Un usuario puede confirmar un pedido a proveedor unicamente si:
+
+- `users.status = 'ACTIVE'`;
+- existe `user_branches(user_id, branch_id)`;
+- posee al menos un `roles.active = TRUE` del `business_id` correspondiente;
+- uno de esos roles tiene `permissions.code = 'PURCHASE_ORDERS_CONFIRM'`.
+
+El permiso funcional no autoriza automaticamente todas las sucursales.
+
+Se requieren ambas condiciones:
+
+- acceso explicito a `branch_id`;
+- `PURCHASE_ORDERS_CONFIRM`.
+
+Si el usuario no pertenece a la sucursal, devolver `USER_BRANCH_FORBIDDEN`.
+
+Si pertenece a la sucursal pero no tiene el permiso funcional, devolver `USER_PERMISSION_DENIED`.
+
+Estos errores se mantienen compartidos con otros contratos.
+
+Si `users.status <> 'ACTIVE'`, rechazar la confirmacion antes de efectos operativos con codigo conceptual `USER_INACTIVE`.
+
+No existe bypass especial por nombre de rol. Un rol llamado `ADMIN`, `MANAGER` o `PURCHASING_MANAGER` no autoriza por si mismo.
+
+Incluso un administrador debe poseer `PURCHASE_ORDERS_CONFIRM` mediante `role_permissions`.
+
+La autorizacion debe ocurrir:
+
+- despues de resolver/reservar idempotencia;
+- dentro de FASE B antes de cualquier efecto operativo;
+- antes de crear allocations;
+- antes de incrementar `committed_qty_base`;
+- antes de crear `ORDER_RESERVE`;
+- antes de cambiar `purchase_orders` a `CONFIRMED`.
+
+Puede ocurrir despues de bloquear `purchase_orders(id)`, porque ese lock es necesario para serializar el agregado y resolver si el pedido ya estaba confirmado o es reconciliable.
+
+No cambiar el orden global de locks por esta validacion.
+
+Tambien se debe validar que `purchase_orders.branch_id = branch_id` esperado y que esa sucursal pertenezca al `business_id` del contexto.
+
+No permitir confirmar un pedido de otra sucursal usando unicamente el id.
+
+No se definen todavia todos los codigos de mismatch si siguen formando parte del catalogo general pendiente.
+
+Este micro-hito solo define el contrato. No insertar `permissions`, crear seeds, modificar schema ni modificar db-3.
+
 ## 4. Estados
 
 `purchase_order_status` existente:
@@ -310,7 +378,7 @@ Pueden entrar conceptualmente en esta categoria:
 - `expected_draft_fingerprint` no coincide;
 - `replenishment_qty_base` ya no cabe;
 - `CLOSED`/`CANCELLED` no confirmable;
-- permisos;
+- autorizacion: `USER_INACTIVE`, `USER_BRANCH_FORBIDDEN` o `USER_PERMISSION_DENIED`;
 - validaciones de dominio.
 
 No se fija todavia todo el catalogo final de errores.
@@ -783,24 +851,26 @@ Dentro de un unico `BEGIN` / `COMMIT` operativo:
 4. Si esta `CLOSED` o `CANCELLED` con `confirmed_at IS NOT NULL` y `confirmed_by_user_id IS NOT NULL`, reconciliar como confirmacion historicamente completada y devolver sin efectos nuevos.
 5. Si esta `CLOSED` o `CANCELLED` sin evidencia autoritativa de confirmacion previa, rechazar como estado no confirmable.
 6. Si esta `DRAFT`, revalidar estado y continuar.
-7. Bloquear/leer `purchase_order_items`.
-8. Recalcular `expected_draft_fingerprint` autoritativo.
-9. Comparar contra el `expected_draft_fingerprint` recibido.
-10. Validar cabecera, lineas, canal, proveedor, productos y unidades.
-11. Agregar `replenishment_qty_base` por producto/canal.
-12. Bloquear `replenishment_positions` en orden estable.
-13. Revalidar `available_to_order_base`.
-14. Rechazar si la intencion de reposicion ya no cabe.
-15. Seleccionar demanda FIFO.
-16. Crear `replenishment_allocations`.
-17. Incrementar `committed_qty_base`.
-18. Crear `ORDER_RESERVE`.
-19. Marcar `purchase_orders.status = 'CONFIRMED'`.
-20. Establecer `confirmed_by_user_id`.
-21. Establecer `confirmed_at`.
-22. Insertar `audit_log`.
-23. Marcar idempotencia como `COMPLETED` dentro del mismo `COMMIT`.
-24. Hacer `COMMIT`.
+7. Validar que `purchase_orders.branch_id = branch_id` esperado y que la sucursal pertenece al `business_id` del contexto.
+8. Validar autorizacion antes de efectos operativos: usuario `ACTIVE`, acceso explicito a `branch_id` y permiso `PURCHASE_ORDERS_CONFIRM`.
+9. Bloquear/leer `purchase_order_items`.
+10. Recalcular `expected_draft_fingerprint` autoritativo.
+11. Comparar contra el `expected_draft_fingerprint` recibido.
+12. Validar cabecera, lineas, canal, proveedor, productos y unidades.
+13. Agregar `replenishment_qty_base` por producto/canal.
+14. Bloquear `replenishment_positions` en orden estable.
+15. Revalidar `available_to_order_base`.
+16. Rechazar si la intencion de reposicion ya no cabe.
+17. Seleccionar demanda FIFO.
+18. Crear `replenishment_allocations`.
+19. Incrementar `committed_qty_base`.
+20. Crear `ORDER_RESERVE`.
+21. Marcar `purchase_orders.status = 'CONFIRMED'`.
+22. Establecer `confirmed_by_user_id`.
+23. Establecer `confirmed_at`.
+24. Insertar `audit_log`.
+25. Marcar idempotencia como `COMPLETED` dentro del mismo `COMMIT`.
+26. Hacer `COMMIT`.
 
 No reescribir `purchase_order_items`.
 
@@ -876,7 +946,6 @@ La regla de mutex de cabecera no agrega `version`, columnas, triggers ni constra
 
 Decisiones todavia no cerradas:
 
-- permiso funcional definitivo;
 - codigos finales de error;
 - auditoria minima definitiva;
 - revision final global del orden de locks y concurrencia;
