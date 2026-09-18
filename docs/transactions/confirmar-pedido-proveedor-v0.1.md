@@ -633,17 +633,133 @@ No guardar:
 
 Para replay puede usarse `response_body` minima o reconstruccion desde `result_entity_type` + `result_entity_id`.
 
-### Fingerprint en audit_log
+### Audit log PURCHASE_ORDER_CONFIRMED
 
-No convertir `audit_log` en requisito de idempotencia.
+Cuando `CONFIRM_ORDER` ejecuta realmente la transicion `purchase_orders.status: DRAFT -> CONFIRMED`, debe insertar un unico evento en `audit_log` dentro de la misma FASE B y el mismo `COMMIT` operativo.
 
-Como decision futura de auditoria, guardar `expected_draft_fingerprint` o el fingerprint autoritativo observado al confirmar podria servir como evidencia auditable.
+Estructura fisica disponible en db-3 para `audit_log`:
 
-No usar `audit_log` como constraint.
+- `id`;
+- `public_id`;
+- `actor_user_id`;
+- `branch_id`;
+- `terminal_id`;
+- `action`;
+- `entity_type`;
+- `entity_id`;
+- `entity_public_id`;
+- `before_data`;
+- `after_data`;
+- `context`;
+- `ip_address`;
+- `user_agent`;
+- `occurred_at`;
+- `created_at`.
 
-No hacer depender la recuperacion idempotente de ese dato.
+`audit_log` no tiene columna fisica `business_id`. Para este evento, `business_id` se registra en `context` usando el JSONB existente.
 
-La politica definitiva de audit sigue pendiente.
+Evento definitivo:
+
+```text
+action = 'PURCHASE_ORDER_CONFIRMED'
+entity_type = 'purchase_orders'
+entity_id = purchase_orders.id
+entity_public_id = purchase_orders.public_id
+actor_user_id = user_id
+branch_id = purchase_orders.branch_id
+```
+
+`terminal_id` es nullable. `CONFIRM_ORDER` no depende funcionalmente de una terminal POS: si la operacion proviene de un contexto autenticado con terminal conocida, puede registrarse; si proviene de panel web/administrativo sin terminal, debe quedar `NULL`.
+
+`before_data` minimo:
+
+```json
+{
+  "status": "DRAFT"
+}
+```
+
+`after_data` minimo:
+
+```json
+{
+  "folio": "PED-000123",
+  "status": "CONFIRMED",
+  "supplier_id": 123,
+  "replenishment_channel": "CASH",
+  "subtotal": "100.00",
+  "tax_total": "16.00",
+  "total": "116.00",
+  "confirmed_at": "2026-09-18T15:00:00-06:00",
+  "line_count": 1,
+  "ordered_qty_base_total": "1.0000",
+  "replenishment_qty_base_total": "1.0000",
+  "customer_special_qty_base_total": "0.0000",
+  "stock_extra_qty_base_total": "0.0000",
+  "reserved_qty_base_total": "1.0000"
+}
+```
+
+Los valores del ejemplo son ilustrativos; la estructura y los campos son el contrato, no esos importes concretos.
+
+Los totales son agregados del pedido confirmado. `reserved_qty_base_total` corresponde a la cantidad realmente reservada por allocations/`ORDER_RESERVE` en esta confirmacion.
+
+No guardar lineas completas en `audit_log`.
+
+`context` minimo:
+
+```json
+{
+  "operation_type": "CONFIRM_ORDER",
+  "flow_version": "v0.1",
+  "business_id": 0,
+  "idempotency_key_ref": "hash_o_truncado_seguro",
+  "expected_draft_fingerprint": "...",
+  "authoritative_draft_fingerprint": "...",
+  "replenishment_allocations_count": 0,
+  "order_reserve_count": 0,
+  "operation_origin": "desktop|web|otro_si_es_confiable"
+}
+```
+
+No guardar la `idempotency_key` completa. Usar una representacion segura, truncada o hasheada, que permita correlacion operacional sin exponer la key completa. No se define algoritmo criptografico concreto.
+
+No duplicar `request_hash` en `audit_log`: `idempotency_keys` conserva la defensa primaria por request y los fingerprints del DRAFT aportan evidencia auditable suficiente para esta transicion. No copiar payload.
+
+El fingerprint en `audit_log` es evidencia de auditoria. No convertirlo en constraint, identidad, requisito de idempotencia ni requisito de recuperacion. No cambia la semantica F1/F2 ya cerrada.
+
+No insertar un nuevo evento `PURCHASE_ORDER_CONFIRMED` cuando la ejecucion solo hace:
+
+- replay de `idempotency_key` `COMPLETED`;
+- reconciliacion de `purchase_order` ya `CONFIRMED`;
+- reconciliacion historica de `CLOSED`;
+- reconciliacion historica de `CANCELLED`;
+- segunda key sobre pedido ya historicamente confirmado.
+
+El evento de confirmacion existe por la transicion real original, no una vez por retry. La reconciliacion solo actualiza/completa idempotencia segun su contrato.
+
+No crear obligatoriamente `audit_log` por cada fallo deterministico de `CONFIRM_ORDER`. Los fallos quedan registrados en `idempotency_keys.status = 'FAILED'`, `error_code` y `error_message` seguro. La auditoria de intentos fallidos de seguridad queda como politica transversal futura si el sistema la necesita.
+
+No guardar en `audit_log`:
+
+- contrasenas;
+- tokens;
+- `idempotency_key` completa;
+- secretos;
+- credenciales;
+- CSD;
+- claves PAC;
+- payload completo;
+- stack traces;
+- SQL;
+- datos innecesarios de proveedor o productos;
+- datos de `inventory_balances` o `inventory_movements`.
+
+`CONFIRMAR PEDIDO` no toca inventario; el evento no debe insinuar aumento de stock.
+
+Si FASE B hace `ROLLBACK`, el evento `PURCHASE_ORDER_CONFIRMED` tambien debe hacer `ROLLBACK`. Nunca debe quedar auditoria indicando confirmacion si la confirmacion operativa no quedo committed.
+
+Esta auditoria cabe en el `audit_log` existente de db-3 y no requiere columnas nuevas, triggers nuevos ni db-4.
 
 ## 6. Autoridad del DRAFT
 
@@ -1071,7 +1187,7 @@ Dentro de un unico `BEGIN` / `COMMIT` operativo:
 26. Marcar `purchase_orders.status = 'CONFIRMED'`.
 27. Establecer `confirmed_by_user_id`.
 28. Establecer `confirmed_at`.
-29. Insertar `audit_log`.
+29. Insertar `audit_log` con `action = 'PURCHASE_ORDER_CONFIRMED'` segun la politica de auditoria definida para la transicion real `DRAFT -> CONFIRMED`.
 30. Marcar idempotencia como `COMPLETED` dentro del mismo `COMMIT`.
 31. Hacer `COMMIT`.
 
@@ -1170,7 +1286,6 @@ La regla de mutex de cabecera no agrega `version`, columnas, triggers ni constra
 
 Decisiones todavia no cerradas:
 
-- auditoria minima definitiva;
 - revision final global del orden de locks y concurrencia.
 
 Los errores `ORDER_IDEMPOTENCY_KEY_REUSED` y `ORDER_IDEMPOTENCY_IN_PROGRESS` quedan cerrados en este borrador.
