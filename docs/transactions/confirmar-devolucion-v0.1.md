@@ -8,7 +8,7 @@ Este documento disena conceptualmente la transaccion `CONFIRMAR DEVOLUCION`. No 
 
 ## Estado del diseno
 
-- Estado: DISENO FUNCIONAL CERRADO / EVOLUCION FISICA VALIDADA
+- Estado: VALIDADO / CONGELADO
 - Version: v0.1
 - Compatible funcionalmente con especificacion maestra v0.5
 - Compatible con modelo fisico PostgreSQL v0.5-db-3; la evolucion fisica requerida ya fue realizada.
