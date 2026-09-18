@@ -106,17 +106,46 @@ Al confirmar, `purchase_orders` + `purchase_order_items` actualmente persistidos
 
 `CONFIRMAR PEDIDO` no aplica de nuevo las lineas de una pantalla del cliente.
 
+### Mutex logico del agregado
+
+Decision cerrada: `purchase_orders(id)` es el mutex logico obligatorio del agregado `purchase_order` + `purchase_order_items`.
+
+Toda mutacion de un pedido `DRAFT` debe adquirir primero `purchase_orders(id) FOR UPDATE` antes de modificar:
+
+- cabecera;
+- lineas;
+- cantidades;
+- proveedor;
+- canal;
+- cualquier dato incluido en `expected_draft_fingerprint`.
+
+Esto incluye conceptualmente:
+
+- agregar `purchase_order_items`;
+- actualizar `purchase_order_items`;
+- eliminar `purchase_order_items`;
+- cambiar `supplier_id`;
+- cambiar `replenishment_channel`;
+- cancelar el `DRAFT`;
+- confirmar el `DRAFT`.
+
+Despues de adquirir `purchase_orders(id) FOR UPDATE`, todo flujo que pretenda editar debe volver a comprobar `purchase_orders.status = 'DRAFT'`.
+
+Si ahora esta `CONFIRMED`, `CLOSED` o `CANCELLED`, la edicion debe rechazarse. No se define todavia codigo final del error.
+
+Esta regla impide que una transaccion que estaba esperando el lock modifique el pedido despues de que otra transaccion lo confirmo, cancelo o cerro.
+
 ## 6. Stale DRAFT
 
 Decision cerrada: el comando usa `expected_draft_fingerprint`.
 
-Orden conceptual:
+Orden autoritativo:
 
 1. Resolver idempotencia.
 2. Bloquear `purchase_orders(id)`.
-3. Resolver estado.
-4. Si esta `DRAFT`, bloquear/leer sus lineas.
-5. Recalcular fingerprint autoritativo.
+3. Validar o reconciliar estado.
+4. Si esta `DRAFT`, obtener las `purchase_order_items` actuales.
+5. Calcular fingerprint autoritativo de cabecera + lineas.
 6. Comparar con `expected_draft_fingerprint`.
 7. Si no coincide, rechazar antes de producir efectos.
 8. Si coincide, continuar.
@@ -128,6 +157,12 @@ No se define todavia codigo final del error.
 `purchase_order_items` no tiene `version` ni `updated_at`.
 
 Por eso `purchase_orders.updated_at` por si solo no es una precondicion fuerte suficiente para detectar toda modificacion de lineas.
+
+Si todos los flujos de edicion respetan el mutex de cabecera `purchase_orders(id)`, ninguna linea puede insertarse, modificarse o eliminarse entre el calculo del fingerprint y el `COMMIT` de confirmacion.
+
+`expected_draft_fingerprint` sigue siendo necesario para detectar que el usuario intenta confirmar una version distinta de la que reviso.
+
+`purchase_orders.updated_at` es metadato operativo/auditable. No es la precondicion fuerte de concurrencia y no sustituye `expected_draft_fingerprint`.
 
 ## 7. Folio
 
@@ -373,7 +408,22 @@ Dos `DRAFT` distintos que intentan reservar la misma demanda se serializan media
 
 El segundo debe observar `demand_qty_base`, `committed_qty_base` y `available_to_order_base` ya actualizados por el primero.
 
-## 22. Concurrencia con devoluciones
+## 22. Concurrencia entre edicion y confirmacion
+
+Caso conceptual:
+
+- A confirma `DRAFT 123`.
+- B intenta insertar o editar una linea del mismo `DRAFT`.
+
+Ambos deben adquirir primero `purchase_orders(123) FOR UPDATE`.
+
+Si A obtiene primero el lock y confirma, B espera.
+
+Despues del `COMMIT` de A, B adquiere el lock, observa `status = 'CONFIRMED'` y no puede editar.
+
+Resultado: no aparece una phantom line despues del fingerprint ni despues de confirmar.
+
+## 23. Concurrencia con devoluciones
 
 Decision cerrada: `CONFIRMAR PEDIDO` no debe adquirir locks de escritura sobre `sale_items`.
 
@@ -397,7 +447,7 @@ Por tanto:
 - `sales`, `sale_items`, `returns` y `return_items` se leen de forma consistente;
 - no se toma row lock de escritura sobre `sale_items`.
 
-## 23. Orden preliminar de locks
+## 24. Orden preliminar de locks
 
 Orden preliminar actual:
 
@@ -405,6 +455,10 @@ Orden preliminar actual:
 2. `purchase_orders(id)`.
 3. `purchase_order_items` del pedido en orden `line_number, id`.
 4. `replenishment_positions` afectados en orden `product_id, channel`.
+
+El lock sobre `purchase_orders(id)` serializa la confirmacion con cualquier edicion del mismo `DRAFT`.
+
+El bloqueo/lectura de `purchase_order_items` se mantiene como defensa adicional, estabilizacion del trabajo sobre lineas existentes y orden determinista. La proteccion contra phantom lines depende del mutex `purchase_orders(id)`; no debe dependerse solamente de locks sobre lineas existentes.
 
 Lecturas sin lock de escritura:
 
@@ -425,7 +479,7 @@ No bloquear `sale_items FOR UPDATE`.
 
 Este orden todavia sera revisado antes del freeze final.
 
-## 24. Flujo transaccional inicial
+## 25. Flujo transaccional inicial
 
 ### FASE A - Idempotencia
 
@@ -438,10 +492,10 @@ No se define todavia el lifecycle exacto de lease, retencion, `FAILED`, fallos t
 Dentro de un unico `BEGIN` / `COMMIT` operativo:
 
 1. Bloquear y verificar la `idempotency_key` reservada.
-2. Bloquear `purchase_orders(id)`.
+2. Bloquear `purchase_orders(id)`; este lock serializa la confirmacion con cualquier edicion del mismo `DRAFT`.
 3. Si esta `CONFIRMED`, reconciliar y devolver sin efectos nuevos.
 4. Si esta `CLOSED` o `CANCELLED`, rechazar.
-5. Si esta `DRAFT`, continuar.
+5. Si esta `DRAFT`, revalidar estado y continuar.
 6. Bloquear/leer `purchase_order_items`.
 7. Recalcular `expected_draft_fingerprint` autoritativo.
 8. Comparar contra el `expected_draft_fingerprint` recibido.
@@ -469,7 +523,7 @@ Conceptualmente, los errores deterministicos pueden requerir persistencia `FAILE
 
 No se fija todavia el lifecycle exacto.
 
-## 25. Atomicidad
+## 26. Atomicidad
 
 En el mismo `COMMIT` deben quedar consistentes:
 
@@ -493,7 +547,7 @@ Si hay `ROLLBACK`, no debe quedar:
 - auditoria aislada;
 - idempotencia `COMPLETED` apuntando a confirmacion inexistente.
 
-## 26. Inventario
+## 27. Inventario
 
 `CONFIRMAR PEDIDO` no modifica:
 
@@ -504,7 +558,7 @@ El pedido no aumenta inventario.
 
 El inventario cambia posteriormente en `CONFIRMAR COMPRA`.
 
-## 27. Aislamiento
+## 28. Aislamiento
 
 Propuesta actual:
 
@@ -514,9 +568,13 @@ READ COMMITTED + locks explicitos
 
 No usar `SERIALIZABLE` por defecto en este borrador.
 
+Para el problema especifico de edicion vs confirmacion de DRAFT, `READ COMMITTED + locks explicitos` es suficiente porque `purchase_orders(id)` serializa el agregado y `replenishment_positions` serializa reservas concurrentes.
+
 Debe validarse con revision de concurrencia antes del freeze final.
 
-## 28. Puntos todavia pendientes
+La regla de mutex de cabecera no agrega `version`, columnas, triggers ni constraints, y no requiere db-4. Es contrato de servicio/transaccion sobre db-3.
+
+## 29. Puntos todavia pendientes
 
 Decisiones todavia no cerradas:
 
@@ -529,8 +587,8 @@ Decisiones todavia no cerradas:
   - `response_body`;
 - codigos finales de error;
 - auditoria minima definitiva;
-- revision final del orden de locks y concurrencia;
+- revision final global del orden de locks y concurrencia;
 - politica concreta del error de `expected_draft_fingerprint`;
 - politica concreta del error cuando `replenishment_qty_base` excede `available_to_order_base`.
 
-No quedan pendientes sobre db-4, `client_operation_id`, folio, FIFO, autoridad del `DRAFT`, mecanismo `expected_draft_fingerprint`, comportamiento de demanda cambiante, `CASH`/`TRANSFER`, `ORDER_RESERVE`, allocations ni `committed_qty_base` para este borrador inicial.
+No quedan pendientes sobre db-4, `client_operation_id`, folio, FIFO, autoridad del `DRAFT`, mutex de cabecera para edicion vs confirmacion, mecanismo `expected_draft_fingerprint`, comportamiento de demanda cambiante, `CASH`/`TRANSFER`, `ORDER_RESERVE`, allocations ni `committed_qty_base` para este borrador inicial.
