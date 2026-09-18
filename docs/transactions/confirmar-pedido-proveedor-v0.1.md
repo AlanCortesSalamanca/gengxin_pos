@@ -130,7 +130,7 @@ La autorizacion debe ocurrir:
 - antes de crear `ORDER_RESERVE`;
 - antes de cambiar `purchase_orders` a `CONFIRMED`.
 
-Puede ocurrir despues de bloquear `purchase_orders(id)`, porque ese lock es necesario para serializar el agregado y resolver si el pedido ya estaba confirmado o es reconciliable.
+Debe ocurrir despues de bloquear `purchase_orders(id)` y antes de cualquier reconciliacion por estado del pedido para una key nueva o `IN_PROGRESS` recuperable. El lock es necesario para serializar el agregado, pero no autoriza por si mismo devolver o reconciliar un pedido confirmado.
 
 No cambiar el orden global de locks por esta validacion.
 
@@ -138,9 +138,203 @@ Tambien se debe validar que `purchase_orders.branch_id = branch_id` esperado y q
 
 No permitir confirmar un pedido de otra sucursal usando unicamente el id.
 
-No se definen todavia todos los codigos de mismatch si siguen formando parte del catalogo general pendiente.
+Tampoco permitir reconciliar/devolver un pedido ya confirmado de otra sucursal o sin autorizacion suficiente usando una nueva `idempotency_key` o una key `IN_PROGRESS` recuperable.
+
+Los codigos aplicables de sucursal/business para `CONFIRM_ORDER` quedan definidos en el catalogo de errores de este documento.
 
 Este micro-hito solo define el contrato. No insertar `permissions`, crear seeds, modificar schema ni modificar db-3.
+
+## 3.2. Catalogo definitivo de errores de dominio CONFIRM_ORDER
+
+Este catalogo aplica a `operation_type = 'CONFIRM_ORDER'`.
+
+No define HTTP status, response envelope, endpoint, DTO ni textos de UI/localizacion.
+
+Cuando se persista `error_message` en `idempotency_keys`, debe ser seguro, breve, sin secretos, sin hashes completos, sin SQL y sin stack traces.
+
+### Catalogo definitivo
+
+Idempotencia:
+
+- `ORDER_IDEMPOTENCY_KEY_REUSED`;
+- `ORDER_IDEMPOTENCY_IN_PROGRESS`.
+
+Autorizacion:
+
+- `USER_INACTIVE`;
+- `USER_BRANCH_FORBIDDEN`;
+- `USER_PERMISSION_DENIED`.
+
+Sucursal / business:
+
+- `BRANCH_INACTIVE`;
+- `BRANCH_BUSINESS_MISMATCH`;
+- `PURCHASE_ORDER_BRANCH_MISMATCH`.
+
+Pedido:
+
+- `PURCHASE_ORDER_NOT_FOUND`;
+- `PURCHASE_ORDER_STATUS_INVALID`;
+- `PURCHASE_ORDER_EMPTY`;
+- `ORDER_DRAFT_STALE`;
+- `ORDER_REPLENISHMENT_STALE`.
+
+Proveedor:
+
+- `SUPPLIER_INACTIVE`;
+- `SUPPLIER_BUSINESS_MISMATCH`.
+
+Producto / unidad:
+
+- `PRODUCT_INACTIVE`;
+- `PRODUCT_BUSINESS_MISMATCH`;
+- `PRODUCT_UNIT_INVALID`.
+
+### ORDER_DRAFT_STALE
+
+`ORDER_DRAFT_STALE` ocurre cuando el `expected_draft_fingerprint` recibido no coincide con el fingerprint autoritativo del `DRAFT` persistido.
+
+Significa que el contenido del `DRAFT` cambio desde que el usuario lo reviso.
+
+Comportamiento:
+
+- rechazar antes de efectos operativos;
+- no exponer hashes completos;
+- tratar como error deterministico;
+- la `idempotency_key` actual termina `FAILED`;
+- para corregir, usar nueva `idempotency_key`, nuevo `request_hash` y nuevo `expected_draft_fingerprint`.
+
+Mensaje seguro conceptual: "El pedido fue modificado desde la ultima revision. Actualiza y revisa el borrador antes de confirmarlo."
+
+### ORDER_REPLENISHMENT_STALE
+
+`ORDER_REPLENISHMENT_STALE` ocurre cuando, despues de bloquear `replenishment_positions`, para algun `branch/product/channel` afectado:
+
+```text
+SUM(replenishment_qty_base persistido aplicable) > available_to_order_base actual
+```
+
+Significa que el `DRAFT` puede seguir siendo exactamente el mismo, pero cambio externamente la demanda de reposicion disponible.
+
+Comportamiento:
+
+- rechazar toda la confirmacion;
+- no reservar parcialmente;
+- no convertir excedente a `stock_extra`;
+- no modificar `purchase_order_items`;
+- exigir revisar/reclasificar el `DRAFT`;
+- tratar como error deterministico;
+- la `idempotency_key` actual termina `FAILED`.
+
+Mensaje seguro conceptual: "La demanda de reposicion cambio. Revisa las cantidades del pedido antes de confirmarlo."
+
+No exponer cantidades internas innecesarias en `error_message` si no son necesarias.
+
+### PURCHASE_ORDER_EMPTY
+
+`PURCHASE_ORDER_EMPTY` ocurre cuando, despues de bloquear `purchase_orders` y obtener las lineas, no existe ninguna `purchase_order_item` del pedido.
+
+Un pedido puede permanecer vacio mientras esta `DRAFT`, pero no puede confirmarse sin al menos una linea valida.
+
+Debe fallar antes de:
+
+- bloquear `replenishment_positions`;
+- crear `replenishment_allocations`;
+- crear `ORDER_RESERVE`;
+- cambiar `purchase_orders` a `CONFIRMED`.
+
+Es error deterministico.
+
+Mensaje seguro conceptual: "El pedido debe contener al menos una linea antes de confirmarse."
+
+No requiere constraint fisico.
+
+### Pedido y estado
+
+`PURCHASE_ORDER_NOT_FOUND` se usa cuando `purchase_order_id` no corresponde a un `purchase_orders` visible/valido para la operacion. No revelar informacion sensible de pedidos de otros tenants.
+
+`PURCHASE_ORDER_BRANCH_MISMATCH` se usa cuando el pedido fue localizado de forma segura pero `purchase_orders.branch_id != branch_id` esperado del comando/contexto. No intentar confirmar ni reconciliar efectos de otra sucursal.
+
+`PURCHASE_ORDER_STATUS_INVALID` se usa unicamente para intento nuevo de confirmar un estado no confirmable sin evidencia de confirmacion historica.
+
+Aplica a `CLOSED` y `CANCELLED` cuando no existen ambas evidencias:
+
+- `confirmed_at`;
+- `confirmed_by_user_id`.
+
+No se usa para `CONFIRMED`, porque `CONFIRMED` se reconcilia idempotentemente.
+
+No se usa para `CLOSED`/`CANCELLED` con evidencia historica de confirmacion, porque esos casos tambien se reconcilian.
+
+No crear un error especifico de pedido ya confirmado.
+
+### Branch / business
+
+`BRANCH_INACTIVE` reutiliza el codigo compartido para sucursal del contexto inexistente, invalida o no operativa/activa para la operacion. No se crea `BRANCH_NOT_FOUND` en este contrato.
+
+`BRANCH_BUSINESS_MISMATCH` ocurre cuando `branch_id` no pertenece al `business_id` esperado del contexto.
+
+`BRANCH_BUSINESS_MISMATCH` es inconsistencia tenant/business del recurso/contexto. `USER_BRANCH_FORBIDDEN` es falta de acceso del usuario a una sucursal valida.
+
+### Proveedor
+
+`SUPPLIER_INACTIVE` ocurre si el proveedor del `DRAFT` existe pero `suppliers.active = FALSE`.
+
+`SUPPLIER_BUSINESS_MISMATCH` ocurre si `supplier_id` no pertenece al `business_id` esperado.
+
+En ambos casos se rechaza la confirmacion y no se modifica el pedido.
+
+`supplier_id` inexistente en un `DRAFT` persistido protegido por FK es invariante roto/error interno, no error publico normal de `CONFIRM_ORDER`.
+
+### Producto / unidad
+
+`PRODUCT_INACTIVE` reutiliza la semantica global: algun `product_id` de `purchase_order_items` existe pero esta inactivo. El `DRAFT` conserva historia/snapshot, pero no puede confirmarse como nueva operacion usando un producto inactivo.
+
+`PRODUCT_BUSINESS_MISMATCH` ocurre si algun producto pertenece a otro `business_id`. No crear prefijo especifico de pedido.
+
+`PRODUCT_UNIT_INVALID` ocurre si la unidad/presentacion operativa de una linea no es valida para su `product_id` segun las relaciones vigentes necesarias para confirmar. No crear multiples codigos especificos de unidad.
+
+### Constraints e invariantes internos
+
+No agregar al catalogo publico errores especificos para estados que db-3 ya impide persistir normalmente:
+
+- `ordered_qty <= 0`;
+- `ordered_qty_base <= 0`;
+- cantidades negativas por motivo;
+- suma de motivos distinta de `ordered_qty_base`;
+- `factor_to_base_snapshot <= 0`;
+- `product_unit_id` fisicamente incompatible con `product_id`;
+- `status` fuera del enum;
+- `supplier_id` inexistente por FK;
+- `product_id` inexistente por FK.
+
+Si alguno aparece por corrupcion, datos legacy o bypass de constraints, tratarlo como invariante interno/tecnico y no inventar un codigo de dominio distinto por constraint.
+
+### Idempotencia y reconciliacion
+
+No crear un error publico generico para una key `FAILED`.
+
+Una key `FAILED` con mismo `request_hash` devuelve el error de dominio original almacenado.
+
+No son errores de `CONFIRM_ORDER`:
+
+- `idempotency_key` `COMPLETED` con mismo hash: replay/reconstruccion del resultado;
+- `idempotency_key` `FAILED` con mismo hash: replay del error original, sin nueva ejecucion;
+- `purchase_orders.status = 'CONFIRMED'`, despues de validar ambito y autorizacion para la solicitud actual;
+- `CLOSED` con evidencia historica de confirmacion, despues de validar ambito y autorizacion para la solicitud actual;
+- `CANCELLED` con evidencia historica de confirmacion, despues de validar ambito y autorizacion para la solicitud actual;
+- nueva `idempotency_key` sobre pedido ya historicamente confirmado, despues de validar ambito y autorizacion para la solicitud actual.
+
+En esos casos aplicar el lifecycle idempotente ya cerrado.
+
+### Cambio fisico
+
+Este catalogo no requiere:
+
+- columna;
+- constraint;
+- trigger;
+- db-4.
 
 ## 4. Estados
 
@@ -266,6 +460,7 @@ Si el pedido sigue `status = 'DRAFT'` y no existe evidencia de confirmacion prev
 
 Antes de cualquier efecto debe:
 
+- validar ambito `business_id` / `branch_id` y autorizacion de la solicitud actual;
 - obtener el `DRAFT` autoritativo;
 - recalcular fingerprint;
 - comparar `expected_draft_fingerprint`.
@@ -281,6 +476,8 @@ Si `purchase_orders.status = 'CONFIRMED'`, no repetir:
 - `ORDER_RESERVE`;
 - audit de confirmacion;
 - ningun efecto operacional.
+
+Para una key nueva o `IN_PROGRESS` recuperable, esta reconciliacion solo puede ocurrir despues de validar ambito `business_id` / `branch_id` y autorizacion de la solicitud actual.
 
 Reconciliar la key `IN_PROGRESS` actual hacia:
 
@@ -303,7 +500,7 @@ Para reconciliar un retry tardio de `CONFIRM_ORDER` debe existir evidencia autor
 - `confirmed_at IS NOT NULL`;
 - `confirmed_by_user_id IS NOT NULL`.
 
-Si esa evidencia existe, no repetir efectos, reconciliar la key `IN_PROGRESS` hacia `COMPLETED` y devolver o referenciar el `purchase_order` existente.
+Si esa evidencia existe, despues de validar ambito `business_id` / `branch_id` y autorizacion de la solicitud actual, no repetir efectos, reconciliar la key `IN_PROGRESS` hacia `COMPLETED` y devolver o referenciar el `purchase_order` existente.
 
 Si la evidencia no existe, tratarlo como estado no confirmable y no inventar una historia de confirmacion.
 
@@ -316,7 +513,7 @@ Si la evidencia no existe, tratarlo como estado no confirmable y no inventar una
 
 Si `confirmed_at IS NOT NULL` y `confirmed_by_user_id IS NOT NULL`, existe evidencia de confirmacion historica.
 
-Para una key `IN_PROGRESS` recuperada, no repetir efectos y puede reconciliarse como confirmacion historicamente completada.
+Para una key `IN_PROGRESS` recuperada, despues de validar ambito `business_id` / `branch_id` y autorizacion de la solicitud actual, no repetir efectos y puede reconciliarse como confirmacion historicamente completada.
 
 Si no existe esa evidencia, tratar el pedido como cancelado antes de confirmacion y por tanto no confirmable.
 
@@ -328,7 +525,7 @@ Si `K1` confirma `purchase_order_id = 123` y posteriormente llega una nueva key 
 
 FASE B bloquea `purchase_orders(123)`.
 
-Si el pedido esta `CONFIRMED`, o esta `CLOSED`/`CANCELLED` con evidencia autoritativa de confirmacion historica, reconciliar `K2` hacia `COMPLETED` apuntando al mismo `purchase_order`.
+Si el pedido esta `CONFIRMED`, o esta `CLOSED`/`CANCELLED` con evidencia autoritativa de confirmacion historica, validar primero ambito `business_id` / `branch_id` y autorizacion de la solicitud actual; solo despues reconciliar `K2` hacia `COMPLETED` apuntando al mismo `purchase_order`.
 
 Esto aplica a una key nueva o `IN_PROGRESS` recuperable.
 
@@ -368,20 +565,20 @@ Si FASE B falla por error de dominio deterministico:
 4. Verificar `request_hash`.
 5. Marcar `status = 'FAILED'`.
 6. Guardar `error_code` de dominio estable.
-7. Guardar `error_message` seguro.
+7. Guardar `error_message` seguro, breve, sin secretos, hashes completos, SQL ni stack traces.
 8. Establecer `locked_until = NULL`.
 9. Establecer `expires_at = now() + 30 dias`.
 10. Hacer `COMMIT`.
 
 Pueden entrar conceptualmente en esta categoria:
 
-- `expected_draft_fingerprint` no coincide;
-- `replenishment_qty_base` ya no cabe;
-- `CLOSED`/`CANCELLED` no confirmable;
 - autorizacion: `USER_INACTIVE`, `USER_BRANCH_FORBIDDEN` o `USER_PERMISSION_DENIED`;
-- validaciones de dominio.
+- sucursal/business: `BRANCH_INACTIVE` o `BRANCH_BUSINESS_MISMATCH`;
+- pedido: `PURCHASE_ORDER_NOT_FOUND`, `PURCHASE_ORDER_BRANCH_MISMATCH`, `PURCHASE_ORDER_STATUS_INVALID`, `PURCHASE_ORDER_EMPTY`, `ORDER_DRAFT_STALE` u `ORDER_REPLENISHMENT_STALE`;
+- proveedor: `SUPPLIER_INACTIVE` o `SUPPLIER_BUSINESS_MISMATCH`;
+- producto/unidad: `PRODUCT_INACTIVE`, `PRODUCT_BUSINESS_MISMATCH` o `PRODUCT_UNIT_INVALID`.
 
-No se fija todavia todo el catalogo final de errores.
+Despues del `ROLLBACK` operativo, FASE C persiste `FAILED` con el codigo original.
 
 ### Correccion despues de FAILED
 
@@ -499,14 +696,15 @@ Orden autoritativo:
 
 1. Resolver idempotencia.
 2. Bloquear `purchase_orders(id)`.
-3. Validar o reconciliar estado.
-4. Si esta `DRAFT`, obtener las `purchase_order_items` actuales.
-5. Calcular fingerprint autoritativo de cabecera + lineas.
-6. Comparar con `expected_draft_fingerprint`.
-7. Si no coincide, rechazar antes de producir efectos.
-8. Si coincide, continuar.
+3. Validar ambito `business_id` / `branch_id` y autorizacion de la solicitud actual.
+4. Resolver o reconciliar estado.
+5. Si esta `DRAFT`, obtener las `purchase_order_items` actuales.
+6. Calcular fingerprint autoritativo de cabecera + lineas.
+7. Comparar con `expected_draft_fingerprint`.
+8. Si no coincide, rechazar con `ORDER_DRAFT_STALE` antes de producir efectos.
+9. Si coincide, continuar.
 
-No se define todavia codigo final del error.
+`ORDER_DRAFT_STALE` es error deterministico y la key actual termina `FAILED`.
 
 `purchase_orders` no tiene columna `version`.
 
@@ -580,7 +778,7 @@ No se debe:
 
 La confirmacion debe rechazarse como `DRAFT` obsoleto respecto a reposicion y exigir revision/edicion previa.
 
-No se define todavia codigo final del error.
+El codigo definitivo es `ORDER_REPLENISHMENT_STALE`.
 
 Motivo: la razon persistida debe conservar trazabilidad.
 
@@ -846,31 +1044,36 @@ La reserva idempotente ocurre en una transaccion corta dedicada a `idempotency_k
 Dentro de un unico `BEGIN` / `COMMIT` operativo:
 
 1. Bloquear y verificar la `idempotency_key` reservada.
-2. Bloquear `purchase_orders(id)`; este lock serializa la confirmacion con cualquier edicion del mismo `DRAFT`.
-3. Si esta `CONFIRMED`, reconciliar idempotencia hacia `COMPLETED` y devolver sin efectos nuevos.
-4. Si esta `CLOSED` o `CANCELLED` con `confirmed_at IS NOT NULL` y `confirmed_by_user_id IS NOT NULL`, reconciliar como confirmacion historicamente completada y devolver sin efectos nuevos.
-5. Si esta `CLOSED` o `CANCELLED` sin evidencia autoritativa de confirmacion previa, rechazar como estado no confirmable.
-6. Si esta `DRAFT`, revalidar estado y continuar.
-7. Validar que `purchase_orders.branch_id = branch_id` esperado y que la sucursal pertenece al `business_id` del contexto.
-8. Validar autorizacion antes de efectos operativos: usuario `ACTIVE`, acceso explicito a `branch_id` y permiso `PURCHASE_ORDERS_CONFIRM`.
-9. Bloquear/leer `purchase_order_items`.
-10. Recalcular `expected_draft_fingerprint` autoritativo.
-11. Comparar contra el `expected_draft_fingerprint` recibido.
-12. Validar cabecera, lineas, canal, proveedor, productos y unidades.
-13. Agregar `replenishment_qty_base` por producto/canal.
-14. Bloquear `replenishment_positions` en orden estable.
-15. Revalidar `available_to_order_base`.
-16. Rechazar si la intencion de reposicion ya no cabe.
-17. Seleccionar demanda FIFO.
-18. Crear `replenishment_allocations`.
-19. Incrementar `committed_qty_base`.
-20. Crear `ORDER_RESERVE`.
-21. Marcar `purchase_orders.status = 'CONFIRMED'`.
-22. Establecer `confirmed_by_user_id`.
-23. Establecer `confirmed_at`.
-24. Insertar `audit_log`.
-25. Marcar idempotencia como `COMPLETED` dentro del mismo `COMMIT`.
-26. Hacer `COMMIT`.
+2. Localizar y bloquear `purchase_orders(id)`; si no existe o no es visible/valido para la operacion, rechazar con `PURCHASE_ORDER_NOT_FOUND`. Este lock serializa la confirmacion con cualquier edicion del mismo `DRAFT`.
+3. Validar que el pedido pertenece al `business_id` esperado o aplicar frontera segura de no divulgacion como `PURCHASE_ORDER_NOT_FOUND` si corresponde.
+4. Validar `purchase_orders.branch_id = branch_id` esperado; si no coincide, rechazar con `PURCHASE_ORDER_BRANCH_MISMATCH`.
+5. Validar sucursal/business: sucursal operativa (`BRANCH_INACTIVE`) y `branch_id` pertenece al `business_id` del contexto (`BRANCH_BUSINESS_MISMATCH`).
+6. Validar usuario `ACTIVE`; si no, rechazar con `USER_INACTIVE`.
+7. Validar acceso explicito a `branch_id`; si no, rechazar con `USER_BRANCH_FORBIDDEN`.
+8. Validar permiso `PURCHASE_ORDERS_CONFIRM`; si no, rechazar con `USER_PERMISSION_DENIED`.
+9. Si esta `CONFIRMED`, reconciliar idempotencia hacia `COMPLETED` y devolver sin efectos nuevos.
+10. Si esta `CLOSED` o `CANCELLED` con `confirmed_at IS NOT NULL` y `confirmed_by_user_id IS NOT NULL`, reconciliar como confirmacion historicamente completada y devolver sin efectos nuevos.
+11. Si esta `CLOSED` o `CANCELLED` sin evidencia autoritativa de confirmacion previa, rechazar con `PURCHASE_ORDER_STATUS_INVALID`.
+12. Si esta `DRAFT`, revalidar estado y continuar.
+13. Bloquear/leer `purchase_order_items`.
+14. Si no existe ninguna linea, rechazar con `PURCHASE_ORDER_EMPTY`.
+15. Recalcular `expected_draft_fingerprint` autoritativo.
+16. Comparar contra el `expected_draft_fingerprint` recibido; si no coincide, rechazar con `ORDER_DRAFT_STALE`.
+17. Validar cabecera, lineas, canal, proveedor, productos y unidades, incluyendo `SUPPLIER_INACTIVE`, `SUPPLIER_BUSINESS_MISMATCH`, `PRODUCT_INACTIVE`, `PRODUCT_BUSINESS_MISMATCH` y `PRODUCT_UNIT_INVALID` cuando apliquen.
+18. Agregar `replenishment_qty_base` por producto/canal.
+19. Bloquear `replenishment_positions` en orden estable.
+20. Revalidar `available_to_order_base`.
+21. Rechazar con `ORDER_REPLENISHMENT_STALE` si la intencion de reposicion ya no cabe.
+22. Seleccionar demanda FIFO.
+23. Crear `replenishment_allocations`.
+24. Incrementar `committed_qty_base`.
+25. Crear `ORDER_RESERVE`.
+26. Marcar `purchase_orders.status = 'CONFIRMED'`.
+27. Establecer `confirmed_by_user_id`.
+28. Establecer `confirmed_at`.
+29. Insertar `audit_log`.
+30. Marcar idempotencia como `COMPLETED` dentro del mismo `COMMIT`.
+31. Hacer `COMMIT`.
 
 No reescribir `purchase_order_items`.
 
@@ -884,12 +1087,33 @@ Si FASE B falla por error de dominio deterministico:
 4. Verificar `request_hash`.
 5. Marcar `status = 'FAILED'`.
 6. Guardar `error_code` de dominio estable.
-7. Guardar `error_message` seguro.
+7. Guardar `error_message` seguro, breve, sin secretos, hashes completos, SQL ni stack traces.
 8. Establecer `locked_until = NULL`.
 9. Establecer `expires_at = now() + 30 dias`.
 10. Hacer `COMMIT`.
 
 Fallos tecnicos no deterministicos no usan FASE C automaticamente.
+
+Los errores deterministicos que pueden persistirse como `FAILED` durante una ejecucion real de FASE B son:
+
+- `USER_INACTIVE`;
+- `USER_BRANCH_FORBIDDEN`;
+- `USER_PERMISSION_DENIED`;
+- `BRANCH_INACTIVE`;
+- `BRANCH_BUSINESS_MISMATCH`;
+- `PURCHASE_ORDER_NOT_FOUND`;
+- `PURCHASE_ORDER_BRANCH_MISMATCH`;
+- `PURCHASE_ORDER_STATUS_INVALID`;
+- `PURCHASE_ORDER_EMPTY`;
+- `ORDER_DRAFT_STALE`;
+- `ORDER_REPLENISHMENT_STALE`;
+- `SUPPLIER_INACTIVE`;
+- `SUPPLIER_BUSINESS_MISMATCH`;
+- `PRODUCT_INACTIVE`;
+- `PRODUCT_BUSINESS_MISMATCH`;
+- `PRODUCT_UNIT_INVALID`.
+
+FASE C persiste `FAILED` con el codigo original; no transforma estos errores en un codigo generico.
 
 ## 27. Atomicidad
 
@@ -946,11 +1170,8 @@ La regla de mutex de cabecera no agrega `version`, columnas, triggers ni constra
 
 Decisiones todavia no cerradas:
 
-- codigos finales de error;
 - auditoria minima definitiva;
-- revision final global del orden de locks y concurrencia;
-- politica concreta del error de `expected_draft_fingerprint`;
-- politica concreta del error cuando `replenishment_qty_base` excede `available_to_order_base`.
+- revision final global del orden de locks y concurrencia.
 
 Los errores `ORDER_IDEMPOTENCY_KEY_REUSED` y `ORDER_IDEMPOTENCY_IN_PROGRESS` quedan cerrados en este borrador.
 
