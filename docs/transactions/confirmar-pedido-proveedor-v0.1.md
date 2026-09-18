@@ -208,13 +208,17 @@ Mensaje seguro conceptual: "El pedido fue modificado desde la ultima revision. A
 
 ### ORDER_REPLENISHMENT_STALE
 
-`ORDER_REPLENISHMENT_STALE` ocurre cuando, despues de bloquear `replenishment_positions`, para algun `branch/product/channel` afectado:
+`ORDER_REPLENISHMENT_STALE` ocurre cuando, despues de bloquear `replenishment_positions`, para algun `branch/product/channel` afectado, se cumple cualquiera de estas condiciones:
 
 ```text
 SUM(replenishment_qty_base persistido aplicable) > available_to_order_base actual
+
+SUM(replenishment_qty_base persistido aplicable) > total_sale_item_reservable seguro
 ```
 
-Significa que el `DRAFT` puede seguir siendo exactamente el mismo, pero cambio externamente la demanda de reposicion disponible.
+Tambien aplica si, despues de recomputar bajo las barreras de concurrencia, el conjunto de `sale_items` prebloqueados ya no puede materializar integramente la reserva requerida.
+
+Significa que el `DRAFT` puede seguir siendo exactamente el mismo, pero cambio externamente la demanda de reposicion disponible o ya no puede trazarse integramente por FIFO.
 
 Comportamiento:
 
@@ -223,6 +227,7 @@ Comportamiento:
 - no convertir excedente a `stock_extra`;
 - no modificar `purchase_order_items`;
 - exigir revisar/reclasificar el `DRAFT`;
+- no hacer retry interno automatico de FASE B;
 - tratar como error deterministico;
 - la `idempotency_key` actual termina `FAILED`.
 
@@ -882,9 +887,33 @@ available_to_order_base = GREATEST(demand_qty_base - committed_qty_base, 0)
 
 La disponibilidad debe evaluarse dentro de la transaccion despues de bloquear la posicion correspondiente.
 
+Para `CONFIRM_ORDER v0.1`, la posicion agregada no sustituye la trazabilidad FIFO por `sale_item`.
+
+La confirmacion debe respetar dos limites por `branch/product/channel`:
+
+```text
+available_to_order_base
+
+total_sale_item_reservable
+```
+
+`available_to_order_base` es el limite operacional agregado de `replenishment_positions`.
+
+`total_sale_item_reservable` es la suma de `reservable` de `sale_items` elegibles del mismo branch, producto y canal historico, pertenecientes al conjunto seguro prebloqueado para esta ejecucion.
+
+Conceptualmente:
+
+```text
+confirmable_cap = LEAST(available_to_order_base, total_sale_item_reservable)
+```
+
+`confirmable_cap` es solo un limite de validacion. No autoriza reservar automaticamente una cantidad menor.
+
+Si `replenishment_qty_base` solicitado excede `confirmable_cap`, rechazar todo el pedido con `ORDER_REPLENISHMENT_STALE`.
+
 ## 11. Demanda cambio desde el DRAFT
 
-Decision cerrada: si el `DRAFT` persiste `replenishment_qty_base = X` y, al confirmar, `available_to_order_base < X` para la cantidad agregada aplicable, no se confirma.
+Decision cerrada: si el `DRAFT` persiste `replenishment_qty_base = X` y, al confirmar, `available_to_order_base < X` o `total_sale_item_reservable < X` para la cantidad agregada aplicable, no se confirma.
 
 No se debe:
 
@@ -897,6 +926,17 @@ La confirmacion debe rechazarse como `DRAFT` obsoleto respecto a reposicion y ex
 El codigo definitivo es `ORDER_REPLENISHMENT_STALE`.
 
 Motivo: la razon persistida debe conservar trazabilidad.
+
+Ejemplos definitivos:
+
+- si `available_to_order_base = 10`, `total_sale_item_reservable = 6` y `replenishment_qty_base = 10`, devolver `ORDER_REPLENISHMENT_STALE`;
+- si `available_to_order_base = 6`, `total_sale_item_reservable = 10` y `replenishment_qty_base = 10`, devolver `ORDER_REPLENISHMENT_STALE`.
+
+En ambos casos no crear allocations, no incrementar `committed_qty_base`, no crear `ORDER_RESERVE` y no confirmar.
+
+`MANUAL_CORRECTION` puede corregir/reconciliar el agregado de reposicion, pero no crea demanda comercial nueva, demanda FIFO independiente, `sale_item`, allocation ni capacidad reservable independiente.
+
+Una compra sin demanda trazable de `sale_item` debe clasificarse como `stock_extra_qty_base` o `customer_special_qty_base`, segun su motivo real.
 
 ## 12. Pedido menor que demanda
 
@@ -979,6 +1019,20 @@ reservable =
 
 La posicion agregada `replenishment_positions` sigue siendo la barrera autoritativa para reserva concurrente.
 
+Para confirmar un pedido, `total_sale_item_reservable` se calcula como:
+
+```text
+SUM(reservable)
+```
+
+solo de `sale_items`:
+
+- del mismo branch;
+- del mismo producto;
+- del mismo `replenishment_channel` historico;
+- elegibles por FIFO;
+- pertenecientes al conjunto seguro prebloqueado por la ejecucion actual.
+
 ## 17. FIFO
 
 Orden FIFO determinista:
@@ -991,6 +1045,10 @@ Orden FIFO determinista:
 El desempate debe ser estable incluso con timestamps iguales.
 
 No se agregan nuevas columnas.
+
+Toda cantidad confirmada como reposicion debe asignarse integramente a `sale_items` trazables por FIFO. En v0.1 no existe reposicion confirmada sin trazabilidad FIFO materializable.
+
+Despues de adquirir la primera `replenishment_positions`, `CONFIRM_ORDER` no puede ampliar el conjunto FIFO ni adquirir nuevos locks sobre `sale_items`. FIFO para efectos debe usar solo `sale_items` prebloqueados.
 
 ## 18. replenishment_allocations
 
@@ -1012,6 +1070,8 @@ No crear allocations de reposicion para:
 - `customer_special_qty_base`.
 
 Mantener la unicidad existente `UNIQUE(sale_item_id, purchase_order_item_id)`.
+
+Esta unicidad no sustituye el mutex de `replenishment_positions`. Dos pedidos distintos pueden reservar porciones distintas de un mismo `sale_item` con distinto `purchase_order_item_id`, siempre que la posicion y `active_reserved` lo permitan.
 
 No reescribir allocations historicas ajenas.
 
@@ -1064,6 +1124,12 @@ Orden entre lineas del mismo producto:
 1. `purchase_order_items.line_number ASC`.
 2. `purchase_order_items.id ASC`.
 
+La asignacion debe evitar doble consumo de un mismo reservable entre varias lineas del mismo pedido.
+
+`active_reserved` debe considerar allocations creadas por lineas anteriores del mismo `CONFIRM_ORDER` durante la ejecucion, o la asignacion debe planearse de forma conjunta antes de insertar.
+
+La suma de allocations nuevas debe corresponder a la suma de `replenishment_qty_base` efectivamente confirmada.
+
 ## 22. Concurrencia entre pedidos
 
 Barrera principal:
@@ -1076,7 +1142,14 @@ bloqueada para actualizacion.
 
 Dos `DRAFT` distintos que intentan reservar la misma demanda se serializan mediante esa posicion.
 
-El segundo debe observar `demand_qty_base`, `committed_qty_base` y `available_to_order_base` ya actualizados por el primero.
+Dos `CONFIRM_ORDER` distintos pueden tomar `FOR KEY SHARE` sobre los mismos `sale_items`, porque es un lock debil compatible para lectura/referencia.
+
+Luego se serializan en `replenishment_positions`.
+
+Despues de que el primero confirma, el segundo obtiene la posicion, observa `committed_qty_base`, allocations y disponibilidad actualizados, recomputa y:
+
+- confirma si todavia cabe en `available_to_order_base` y `total_sale_item_reservable`;
+- o falla con `ORDER_REPLENISHMENT_STALE`.
 
 ## 23. Concurrencia entre edicion y confirmacion
 
@@ -1095,61 +1168,169 @@ Resultado: no aparece una phantom line despues del fingerprint ni despues de con
 
 ## 24. Concurrencia con devoluciones
 
-Decision cerrada: `CONFIRMAR PEDIDO` no debe adquirir locks de escritura sobre `sale_items`.
+Decision final: `CONFIRM_ORDER` debe adquirir explicitamente `sale_items FOR KEY SHARE` antes de bloquear cualquier `replenishment_positions`.
 
-Motivo: `CONFIRMAR DEVOLUCION` puede seguir este orden:
+Motivo: `replenishment_allocations.sale_item_id` referencia `sale_items`. El `INSERT` de allocations puede requerir un lock de referencia sobre `sale_items`; si ese lock se adquiriera por primera vez despues de tener `replenishment_positions`, podria producir deadlock con `CONFIRMAR DEVOLUCION`.
 
-```text
-sale_items -> replenishment_positions
-```
-
-Si `CONFIRMAR PEDIDO` hiciera:
+Orden compatible de `CONFIRMAR DEVOLUCION`:
 
 ```text
-replenishment_positions -> sale_items FOR UPDATE
+sale_items FOR UPDATE -> replenishment_positions
 ```
 
-podria crear un ciclo de deadlock.
+Orden compatible de `CONFIRM_ORDER`:
 
-Por tanto:
+```text
+sale_items FOR KEY SHARE -> replenishment_positions
+```
 
-- `replenishment_positions` es la barrera de reserva;
-- `sales`, `sale_items`, `returns` y `return_items` se leen de forma consistente;
-- no se toma row lock de escritura sobre `sale_items`.
+Si `CONFIRMAR DEVOLUCION` obtiene primero `sale_items FOR UPDATE`, `CONFIRM_ORDER` espera antes de tener `replenishment_positions`.
 
-## 25. Orden preliminar de locks
+Si `CONFIRM_ORDER` obtiene primero `sale_items FOR KEY SHARE`, `CONFIRMAR DEVOLUCION` espera antes de tener `replenishment_positions`.
 
-Orden preliminar actual:
+Asi ningun flujo puede tener `replenishment_positions` y despues esperar por primera vez un lock de `sale_items` del otro.
+
+No usar `sale_items FOR UPDATE` en `CONFIRM_ORDER`: `FOR KEY SHARE` hace explicito el orden de referencia FK sin bloquear innecesariamente lectores debiles.
+
+## 25. Concurrencia con ventas
+
+Una venta concurrente puede crear nueva demanda.
+
+Si `CONFIRMAR VENTA` obtiene la `replenishment_positions` y confirma antes, `CONFIRM_ORDER` observara esa demanda al obtener la posicion.
+
+Si `CONFIRM_ORDER` obtiene la `replenishment_positions` primero, `CONFIRMAR VENTA` espera y su nueva demanda queda disponible para pedidos posteriores.
+
+`CONFIRM_ORDER` no esta obligado a ampliar su conjunto prebloqueado con `sale_items` creados despues del prelock FIFO.
+
+## 26. Invariante global de reposicion
+
+Toda operacion que vaya a modificar, para un `branch/product/channel`:
+
+- `replenishment_positions.demand_qty_base`;
+- `replenishment_positions.committed_qty_base`;
+- `replenishment_allocations.reserved_qty_base`;
+- `replenishment_allocations.fulfilled_qty_base`;
+- `replenishment_allocations.released_qty_base`;
+- movimientos que materialicen esos cambios;
+
+debe mantener bloqueada la `replenishment_positions` correspondiente antes de realizar esas mutaciones.
+
+Esto no significa que `replenishment_positions` sea siempre el primer lock de toda operacion. Otros locks pueden precederla segun el flujo.
+
+Ejemplos validos:
+
+- `CONFIRMAR DEVOLUCION`: `sale_items -> replenishment_positions`;
+- `CONFIRM_ORDER`: `sale_items FOR KEY SHARE -> replenishment_positions`.
+
+## 27. Orden final de locks v0.1
+
+Orden explicito final:
 
 1. `idempotency_keys` para `CONFIRM_ORDER`.
 2. `purchase_orders(id)`.
-3. `purchase_order_items` del pedido en orden `line_number, id`.
-4. `replenishment_positions` afectados en orden `product_id, channel`.
+3. `purchase_order_items` del pedido en orden `line_number ASC, id ASC`.
+4. `sale_items` candidatos `FOR KEY SHARE`, en orden:
+   - `sales.confirmed_at ASC`;
+   - `sales.id ASC`;
+   - `sale_items.line_number ASC`;
+   - `sale_items.id ASC`.
+5. `replenishment_positions` afectados en orden `product_id ASC, channel ASC`.
+
+Despues vienen las escrituras:
+
+- `replenishment_allocations`;
+- `replenishment_positions.committed_qty_base`;
+- `replenishment_movements ORDER_RESERVE`;
+- `purchase_orders.status = 'CONFIRMED'`;
+- `audit_log`;
+- `idempotency_keys COMPLETED`.
+
+Los `INSERT` pueden tomar locks implicitos por FK. Los `sale_items` relevantes ya fueron prebloqueados antes de `replenishment_positions`.
 
 El lock sobre `purchase_orders(id)` serializa la confirmacion con cualquier edicion del mismo `DRAFT`.
 
 El bloqueo/lectura de `purchase_order_items` se mantiene como defensa adicional, estabilizacion del trabajo sobre lineas existentes y orden determinista. La proteccion contra phantom lines depende del mutex `purchase_orders(id)`; no debe dependerse solamente de locks sobre lineas existentes.
 
-Lecturas sin lock de escritura:
+### Candidatos FIFO prebloqueados
+
+Para cada `branch/product/channel` que el `DRAFT` pretende cubrir como reposicion, antes de bloquear `replenishment_positions`:
+
+1. identificar `sale_items` actualmente candidatos FIFO;
+2. considerar su demanda reservable actual conceptualmente;
+3. adquirir `FOR KEY SHARE` sobre todos los `sale_items` actualmente FIFO-reservables de esos productos/canales afectados.
+
+Para MVP se usa este conjunto conservador en lugar de bloquear solamente la cantidad exacta requerida.
+
+El calculo previo al lock de `replenishment_positions` sirve para definir el conjunto seguro de `sale_items` que se puede usar despues. Todavia no autoriza la reserva.
+
+Despues de tomar `replenishment_positions` debe recomputarse el estado autoritativo necesario para confirmar. Bajo `READ COMMITTED` pueden haber ocurrido cambios entre ambas etapas; eso es esperado.
+
+Despues de adquirir la primera `replenishment_positions`, `CONFIRM_ORDER` no puede:
+
+- ampliar el conjunto FIFO;
+- ejecutar `FOR KEY SHARE` tardio;
+- depender de que un `INSERT` FK adquiera por primera vez lock sobre un `sale_item` no prebloqueado.
+
+Todo `sale_item` que reciba una nueva `replenishment_allocation` debe pertenecer al conjunto prebloqueado.
+
+Si una venta concurrente crea nueva demanda despues del prelock y antes de que `CONFIRM_ORDER` obtenga `replenishment_positions`, `CONFIRM_ORDER` no debe bloquear esos nuevos `sale_items` tardiamente.
+
+Si los candidatos prebloqueados siguen alcanzando para el `DRAFT`, puede confirmar usando el conjunto prebloqueado y FIFO correspondiente.
+
+Si los candidatos prebloqueados ya no alcanzan, devolver `ORDER_REPLENISHMENT_STALE`.
+
+No hay retry interno automatico de FASE B. La ejecucion hace `ROLLBACK`, FASE C persiste `FAILED` con `ORDER_REPLENISHMENT_STALE`, y para volver a intentar se usa la politica ya definida de nueva key/fingerprint.
+
+### Lecturas sin lock fuerte
+
+Lecturas sin lock fuerte:
 
 - `branches`;
 - `suppliers`;
 - `products`;
 - `product_units`;
-- `sales`;
-- `sale_items`;
+- `sales` para orden/metadata;
 - `returns`;
 - `return_items`;
 - `replenishment_allocations` existentes;
 - otros catalogos estrictamente necesarios.
 
+`sale_items` candidatos FIFO afectados ya no son simple lectura sin lock: deben prebloquearse con `FOR KEY SHARE`.
+
+Puede haber lecturas normales de otros `sale_items` no relevantes si existen.
+
+`replenishment_allocations` existentes se leen bajo la seguridad logica de `replenishment_positions` como mutex antes de materializar efectos.
+
 No incluir `document_sequences`.
 
-No bloquear `sale_items FOR UPDATE`.
+### Restricciones para flujos futuros
 
-Este orden todavia sera revisado antes del freeze final.
+`CANCEL_ORDER` que modifique allocations, `committed_qty_base` u `ORDER_RELEASE` debe respetar `replenishment_positions` como mutex de mutacion. Si necesita interactuar con `sale_items`, no puede introducir un orden inverso `replenishment_positions -> sale_items` incompatible con este contrato.
 
-## 26. Flujo transaccional inicial
+`CONFIRM_PURCHASE` debe respetar `replenishment_positions` antes de mutar:
+
+- `fulfilled_qty_base`;
+- `released_qty_base`;
+- `committed_qty_base`;
+- demanda/cobertura relacionada.
+
+No debe invertir el orden `purchase_orders -> purchase_order_items -> sale_items si aplica -> replenishment_positions` cuando participe de estos mismos recursos.
+
+No se disena el orden de locks de inventario de `CONFIRM_PURCHASE` en este documento.
+
+### Cambio fisico
+
+Este contrato de concurrencia no requiere:
+
+- columna;
+- constraint;
+- trigger;
+- indice obligatorio para correctitud;
+- db-4.
+
+Un indice para acelerar la seleccion FIFO puede evaluarse posteriormente con datos reales y `EXPLAIN`; seria una optimizacion de performance, no condicion de correctitud.
+
+## 28. Flujo transaccional inicial
 
 ### FASE A - Reserva idempotente
 
@@ -1176,20 +1357,24 @@ Dentro de un unico `BEGIN` / `COMMIT` operativo:
 15. Recalcular `expected_draft_fingerprint` autoritativo.
 16. Comparar contra el `expected_draft_fingerprint` recibido; si no coincide, rechazar con `ORDER_DRAFT_STALE`.
 17. Validar cabecera, lineas, canal, proveedor, productos y unidades, incluyendo `SUPPLIER_INACTIVE`, `SUPPLIER_BUSINESS_MISMATCH`, `PRODUCT_INACTIVE`, `PRODUCT_BUSINESS_MISMATCH` y `PRODUCT_UNIT_INVALID` cuando apliquen.
-18. Agregar `replenishment_qty_base` por producto/canal.
-19. Bloquear `replenishment_positions` en orden estable.
-20. Revalidar `available_to_order_base`.
-21. Rechazar con `ORDER_REPLENISHMENT_STALE` si la intencion de reposicion ya no cabe.
-22. Seleccionar demanda FIFO.
-23. Crear `replenishment_allocations`.
-24. Incrementar `committed_qty_base`.
-25. Crear `ORDER_RESERVE`.
-26. Marcar `purchase_orders.status = 'CONFIRMED'`.
-27. Establecer `confirmed_by_user_id`.
-28. Establecer `confirmed_at`.
-29. Insertar `audit_log` con `action = 'PURCHASE_ORDER_CONFIRMED'` segun la politica de auditoria definida para la transicion real `DRAFT -> CONFIRMED`.
-30. Marcar idempotencia como `COMPLETED` dentro del mismo `COMMIT`.
-31. Hacer `COMMIT`.
+18. Agregar `replenishment_qty_base` requerido por producto/canal.
+19. Identificar candidatos FIFO actuales para los productos/canales afectados.
+20. Adquirir `sale_items FOR KEY SHARE` sobre todos los candidatos actualmente reservables de esos productos/canales, en orden FIFO global: `sales.confirmed_at ASC`, `sales.id ASC`, `sale_items.line_number ASC`, `sale_items.id ASC`.
+21. Bloquear `replenishment_positions` en orden estable `product_id ASC, channel ASC`.
+22. Recomputar `available_to_order_base`.
+23. Recomputar `total_sale_item_reservable` usando solo el conjunto de `sale_items` prebloqueados y el estado committed visible bajo las barreras correspondientes.
+24. Calcular conceptualmente `confirmable_cap = LEAST(available_to_order_base, total_sale_item_reservable)`.
+25. Rechazar con `ORDER_REPLENISHMENT_STALE` si `replenishment_qty_base` requerido excede `available_to_order_base`, `total_sale_item_reservable` o `confirmable_cap`.
+26. Seleccionar demanda FIFO usando solo `sale_items` prebloqueados.
+27. Crear `replenishment_allocations`.
+28. Incrementar `committed_qty_base`.
+29. Crear `ORDER_RESERVE`.
+30. Marcar `purchase_orders.status = 'CONFIRMED'`.
+31. Establecer `confirmed_by_user_id`.
+32. Establecer `confirmed_at`.
+33. Insertar `audit_log` con `action = 'PURCHASE_ORDER_CONFIRMED'` segun la politica de auditoria definida para la transicion real `DRAFT -> CONFIRMED`.
+34. Marcar idempotencia como `COMPLETED` dentro del mismo `COMMIT`.
+35. Hacer `COMMIT`.
 
 No reescribir `purchase_order_items`.
 
@@ -1231,7 +1416,7 @@ Los errores deterministicos que pueden persistirse como `FAILED` durante una eje
 
 FASE C persiste `FAILED` con el codigo original; no transforma estos errores en un codigo generico.
 
-## 27. Atomicidad
+## 29. Atomicidad
 
 En el mismo `COMMIT` deben quedar consistentes:
 
@@ -1255,7 +1440,7 @@ Si hay `ROLLBACK`, no debe quedar:
 - auditoria aislada;
 - idempotencia `COMPLETED` apuntando a confirmacion inexistente.
 
-## 28. Inventario
+## 30. Inventario
 
 `CONFIRMAR PEDIDO` no modifica:
 
@@ -1266,27 +1451,48 @@ El pedido no aumenta inventario.
 
 El inventario cambia posteriormente en `CONFIRMAR COMPRA`.
 
-## 29. Aislamiento
+## 31. Aislamiento
 
-Propuesta actual:
+Decision definitiva MVP:
 
 ```text
 READ COMMITTED + locks explicitos
 ```
 
-No usar `SERIALIZABLE` por defecto en este borrador.
+No usar `REPEATABLE READ` ni `SERIALIZABLE` por defecto para `CONFIRM_ORDER v0.1`.
 
-Para el problema especifico de edicion vs confirmacion de DRAFT, `READ COMMITTED + locks explicitos` es suficiente porque `purchase_orders(id)` serializa el agregado y `replenishment_positions` serializa reservas concurrentes.
+Justificacion:
 
-Debe validarse con revision de concurrencia antes del freeze final.
+- `purchase_orders(id)` serializa el agregado `DRAFT`;
+- `sale_items FOR KEY SHARE` establece orden compatible con devoluciones;
+- `replenishment_positions` serializa estado agregado y mutaciones de reposicion;
+- la recomputacion ocurre despues de adquirir las barreras;
+- el flujo no depende de snapshot unico de transaccion.
 
 La regla de mutex de cabecera no agrega `version`, columnas, triggers ni constraints, y no requiere db-4. Es contrato de servicio/transaccion sobre db-3.
 
-## 30. Puntos todavia pendientes
+## 32. Pruebas de concurrencia futuras
 
-Decisiones todavia no cerradas:
+La implementacion futura debe cubrir, como minimo:
 
-- revision final global del orden de locks y concurrencia.
+1. dos confirmaciones del mismo `DRAFT`;
+2. confirmacion vs edicion de linea;
+3. confirmacion vs cancelacion de `DRAFT`;
+4. dos pedidos sobre la ultima demanda disponible;
+5. pedido multiproducto con orden inverso entre transacciones;
+6. `CONFIRM_ORDER` vs devolucion `RESTOCK`;
+7. `CONFIRM_ORDER` vs venta sobre la misma posicion;
+8. `available_to_order_base > total_sale_item_reservable`;
+9. `available_to_order_base < total_sale_item_reservable`;
+10. nuevo `sale_item` entre prelock FIFO y lock de posicion;
+11. retry tecnico despues de commit desconocido;
+12. segunda `idempotency_key` para el mismo pedido.
+
+## 33. Puntos todavia pendientes
+
+No quedan decisiones funcionales o de concurrencia abiertas para `CONFIRM_ORDER v0.1`.
+
+Queda pendiente unicamente la auditoria final de consistencia previa al cambio formal de estado/freezing.
 
 Los errores `ORDER_IDEMPOTENCY_KEY_REUSED` y `ORDER_IDEMPOTENCY_IN_PROGRESS` quedan cerrados en este borrador.
 
