@@ -927,19 +927,29 @@ La venta crea demanda +qty; una devolución vendible crea demand_delta negativo;
 
 **7.** Mientras el pedido esté en borrador, no cambia reposición, stock ni reservas.
 
-8. Al confirmar, se registran cantidades solicitadas y se reserva únicamente la parte que puede cubrir reposición pendiente del mismo canal.
+8. Al crear o editar el borrador, la cantidad total deseada se clasifica explícitamente entre reposición, pedido especial de cliente y stock extra. Al confirmar, se revalida la cantidad de reposición ya persistida y solo se reserva si todavía cabe en la disponibilidad actual del mismo canal.
 
 ## 14.3 Reglas de cantidad
 
 Las siguientes reglas se aplican independientemente dentro del canal seleccionado. Una cantidad pedida en EFECTIVO no reduce pendientes de TRANSFERENCIA y viceversa.
 
-| **Pendiente vendido** | **Cantidad pedida** | **Reposición reservada** | **Extra planeado** | **Pendiente disponible después de confirmar** |
-|-----------------------|---------------------|--------------------------|--------------------|-----------------------------------------------|
-| 10                    | 10                  | 10                       | 0                  | 0                                             |
-| 10                    | 6                   | 6                        | 0                  | 4                                             |
-| 10                    | 300                 | 10                       | 290                | 0                                             |
-| 3                     | 0 / línea eliminada | 0                        | 0                  | 3                                             |
-| 0                     | 50                  | 0                        | 50                 | 0                                             |
+Durante la creación o edición del DRAFT, para una cantidad total deseada y la demanda disponible observada en ese momento:
+
+```text
+replenishment_planned = MIN(cantidad_total_deseada, pendiente_disponible_al_editar)
+
+extra_planned = MAX(cantidad_total_deseada - replenishment_planned, 0)
+```
+
+El excedente no queda implícito. Debe persistirse explícitamente como `customer_special_qty_base` o `stock_extra_qty_base`, según su motivo real.
+
+| **Pendiente disponible al editar** | **Cantidad total deseada** | **replenishment_qty_base persistido** | **extra/customer_special persistido** | **Pendiente disponible si se confirma sin cambios concurrentes** |
+|------------------------------------|----------------------------|--------------------------------------|--------------------------------------|------------------------------------------------------------------|
+| 10                                 | 10                         | 10                                   | 0                                    | 0                                                                |
+| 10                                 | 6                          | 6                                    | 0                                    | 4                                                                |
+| 10                                 | 300                        | 10                                   | 290                                  | 0                                                                |
+| 3                                  | 0 / línea eliminada        | 0                                    | 0                                    | 3                                                                |
+| 0                                  | 50                         | 0                                    | 50                                   | 0                                                                |
 
 <table>
 <colgroup>
@@ -947,9 +957,12 @@ Las siguientes reglas se aplican independientemente dentro del canal seleccionad
 </colgroup>
 <thead>
 <tr class="header">
-<th>replenishment_reserved = MIN(cantidad_pedida, pendiente_disponible)<br />
-extra_planned = MAX(cantidad_pedida - pendiente_disponible, 0)<br />
-pendiente_disponible_nuevo = MAX(pendiente_disponible - cantidad_pedida, 0)</th>
+<th>Durante edición:<br />
+replenishment_planned = MIN(cantidad_total_deseada, pendiente_disponible_al_editar)<br />
+extra_planned = MAX(cantidad_total_deseada - replenishment_planned, 0)<br />
+<br />
+Durante confirmación:<br />
+replenishment_reserved = replenishment_qty_base persistido solo si replenishment_qty_base &lt;= available_to_order_base actual bajo lock</th>
 </tr>
 </thead>
 <tbody>
@@ -960,11 +973,13 @@ pendiente_disponible_nuevo = MAX(pendiente_disponible - cantidad_pedida, 0)</th>
 
 **Tornillos con compra mínima:** Se vendieron 3, pero el proveedor vende cajas de 1,000. El sistema sugiere 3; el usuario puede eliminar la línea. Las 3 siguen pendientes y reaparecerán en un pedido futuro.
 
-Pedido especial grande: hay 10 módulos pendientes de reposición y un cliente solicita una compra especial adicional. El usuario puede pedir una cantidad mayor y clasificar la diferencia como PEDIDO_ESPECIAL o STOCK_EXTRA; solo la porción de reposición consume pendiente.
+Pedido especial grande: hay 10 módulos pendientes de reposición y el usuario desea pedir 300. El DRAFT persistido debe expresar `replenishment_qty_base = 10` y `stock_extra_qty_base = 290`, o separar parte como `customer_special_qty_base` si corresponde al motivo real. La cantidad total sigue siendo 300. Al confirmar, `ORDER_RESERVE` corresponde únicamente a las 10 de reposición; las 290 no son una conversión automática hecha por CONFIRMAR PEDIDO.
 
 **Pedido menor:** Hay 10 pendientes y se piden 6. Solo 6 quedan reservadas; 4 siguen disponibles para el siguiente pedido.
 
 **Producto sin ventas:** El usuario puede agregar 50 unidades manualmente; todas son extra planeado.
+
+**Cambio concurrente de reposición:** El DRAFT fue revisado con `replenishment_qty_base = 10` y `available_to_order_base = 10`. Antes de confirmar, otra operación modifica la demanda y ahora `available_to_order_base = 6`. En ese caso CONFIRMAR PEDIDO debe rechazar la confirmación, no reservar parcialmente 6, no tratar automáticamente 4 como `stock_extra`, no reescribir `purchase_order_items` y exigir refrescar/revisar/editar el DRAFT. El motivo es que `purchase_order_items` conserva el motivo histórico de la cantidad solicitada y la confirmación no debe alterarlo silenciosamente.
 
 ## 14.4.1 Motivo de la cantidad pedida
 
@@ -1006,6 +1021,10 @@ Pedido de 6 -&gt; cubre/reserva 3 + 2 + 1; quedan 4 pendientes en la última ven
 | CONFIRMED / Confirmado | Reserva la porción de reposición; espera una compra/recepción.                  |
 | CLOSED / Cerrado       | La compra fue confirmada; ya no bloquea cantidades faltantes.                   |
 | CANCELLED / Cancelado  | Libera toda reposición reservada que no haya sido cubierta; no toca inventario. |
+
+Un pedido a proveedor puede permanecer vacío mientras está en DRAFT, pero no puede confirmarse sin al menos una `purchase_order_item` válida. Esta regla no impide guardar el borrador vacío durante edición; solo impide la transición `DRAFT -> CONFIRMED` sin líneas.
+
+La validación de stale de reposición y la prohibición de confirmar un pedido vacío se aplican en servicio/transacción y no requieren columna nueva, constraint nuevo, trigger ni db-4.
 
 ## 14.7 Ledger de reposición
 
@@ -1377,11 +1396,11 @@ quote_items: id, quote_id, product_id, description_snapshot, unit_snapshot/unit_
 
 - RB-09. El pedido en borrador no reserva reposición.
 
-- RB-10. Al confirmar pedido, se reserva como reposición MAX 0 hasta MIN(cantidad pedida, pendiente disponible).
+- RB-10. Al preparar o editar un pedido, la cantidad total deseada se clasifica explícitamente entre reposición y extra/pedido especial según la demanda disponible observada.
 
 - RB-11. Si se pide menos que lo pendiente, la diferencia queda disponible para otro pedido.
 
-- RB-12. Si se pide más que lo pendiente, el pendiente llega a 0 y la diferencia se considera extra planeado.
+- RB-12. Si al confirmar el `replenishment_qty_base` persistido excede la disponibilidad actual bajo lock, no se reclasifica automáticamente; se rechaza y requiere revisión del DRAFT.
 
 - RB-13. Una línea sugerida puede eliminarse; hacerlo no elimina el pendiente.
 
@@ -1484,6 +1503,8 @@ quote_items: id, quote_id, product_id, description_snapshot, unit_snapshot/unit_
 - RB-62. Una cotización vencida no se convierte silenciosamente con condiciones antiguas; requiere revalidación/reemisión o autorización explícita según política.
 
 - RB-63. Cancelar o vencer una cotización no genera movimientos compensatorios porque nunca produjo efectos operativos.
+
+- RB-64. Un pedido a proveedor puede permanecer vacío mientras está en DRAFT, pero no puede confirmarse sin al menos una línea de pedido válida.
 
 # 21. Validaciones y casos límite
 
@@ -1615,7 +1636,7 @@ quote_items: id, quote_id, product_id, description_snapshot, unit_snapshot/unit_
 
 - □ El canal histórico de una venta no cambia aunque posteriormente se edite el mapeo del método de pago.
 
-- □ Pedir menos deja diferencia pendiente; pedir más deja pendiente en 0 y registra extra planeado.
+- □ Pedir menos deja diferencia pendiente; pedir más se clasifica explícitamente en el DRAFT entre reposición y extra/pedido especial.
 
 - □ Confirmar pedido no modifica stock.
 
