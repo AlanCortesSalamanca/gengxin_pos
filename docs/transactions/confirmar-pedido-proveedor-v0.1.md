@@ -6,7 +6,7 @@ Referencia fisica vigente: `docs/database/modelo-fisico-v0.5-db-3.md` y `databas
 
 ## Estado del diseno
 
-- Estado: BORRADOR INICIAL
+- Estado: VALIDADO / CONGELADO
 - Version: v0.1
 - Implementacion: todavia no iniciada
 
@@ -1488,12 +1488,16 @@ La implementacion futura debe cubrir, como minimo:
 11. retry tecnico despues de commit desconocido;
 12. segunda `idempotency_key` para el mismo pedido.
 
-## 33. Puntos todavia pendientes
+## 33. Estado final de CONFIRM_ORDER v0.1
 
 No quedan decisiones funcionales o de concurrencia abiertas para `CONFIRM_ORDER v0.1`.
 
-Queda pendiente unicamente la auditoria final de consistencia previa al cambio formal de estado/freezing.
+No quedan cambios fisicos requeridos y no se requiere db-4.
 
-Los errores `ORDER_IDEMPOTENCY_KEY_REUSED` y `ORDER_IDEMPOTENCY_IN_PROGRESS` quedan cerrados en este borrador.
+La auditoria final de consistencia concluyo APTO PARA FREEZE.
 
-No quedan pendientes sobre db-4, `client_operation_id`, folio, FIFO, autoridad del `DRAFT`, mutex de cabecera para edicion vs confirmacion, mecanismo `expected_draft_fingerprint`, lifecycle exacto de idempotencia, comportamiento de demanda cambiante, `CASH`/`TRANSFER`, `ORDER_RESERVE`, allocations ni `committed_qty_base` para este borrador inicial.
+`CONFIRM_ORDER v0.1` queda VALIDADO / CONGELADO.
+
+Los errores `ORDER_IDEMPOTENCY_KEY_REUSED` y `ORDER_IDEMPOTENCY_IN_PROGRESS` quedan cerrados en este contrato v0.1.
+
+No quedan pendientes sobre db-4, `client_operation_id`, folio, FIFO, autoridad del `DRAFT`, mutex de cabecera para edicion vs confirmacion, mecanismo `expected_draft_fingerprint`, lifecycle exacto de idempotencia, comportamiento de demanda cambiante, `CASH`/`TRANSFER`, `ORDER_RESERVE`, allocations ni `committed_qty_base` para este contrato v0.1.
