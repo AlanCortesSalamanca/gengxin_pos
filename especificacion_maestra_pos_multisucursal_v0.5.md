@@ -1082,7 +1082,7 @@ Este módulo responde: “¿Qué llegó realmente y qué compramos?”. La compr
 
 **9.** Confirmar compra en una sola operación atómica.
 
-10. Al confirmar: incrementar stock con lo recibido, generar movimientos, cubrir reposición únicamente del mismo canal con cantidades efectivamente recibidas, liberar faltantes al mismo canal y cerrar el pedido.
+10. Al confirmar: incrementar stock con lo recibido, generar movimientos, cumplir únicamente reservas de reposición preexistentes del pedido origen con cantidades efectivamente recibidas, liberar faltantes al mismo canal y cerrar el pedido.
 
 ## 15.2 Pantalla conceptual
 
@@ -1109,18 +1109,27 @@ Controlador 5 0 -5<br />
 
 ## 15.3 Reglas de diferencia
 
-| **Caso**                    | **Resultado al confirmar**                                                                                                                     |
-|-----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
-| Llegó exactamente lo pedido | Stock += recibido; pedido se cierra; reposición correspondiente queda cubierta.                                                                |
-| Llegó menos                 | Stock += lo recibido; lo no recibido NO queda esperando a ese pedido: se libera y vuelve al siguiente pedido del mismo canal.                  |
-| Llegó más                   | Stock += todo lo aceptado; primero cubre reposición pendiente aplicable y el excedente queda como stock extra.                                 |
-| No llegó el producto        | Stock no cambia; toda la porción reservada por ese producto se libera al mismo canal.                                                          |
-| Llegó producto equivocado   | Original recibido=0; se agrega el producto real si se acepta. El faltante del producto original se libera al mismo canal.                      |
-| Llegó producto no pedido    | Se agrega manualmente; si se acepta, entra a stock y puede cubrir pendientes del mismo producto y del mismo canal antes de considerarse extra. |
+| **Caso**                    | **Resultado al confirmar**                                                                                                                                                  |
+|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Llegó exactamente lo pedido | Stock += recibido; pedido se cierra; si corresponde a una reserva preexistente del pedido origen, esa reserva queda fulfilled y released=0.                                 |
+| Llegó menos                 | Stock += lo recibido; fulfilled solo por lo recibido aplicable a reservas preexistentes; lo reservado no recibido se libera y vuelve al siguiente pedido del mismo canal.    |
+| Llegó más                   | Stock += todo lo aceptado; solo puede cumplir reservas preexistentes del pedido origen; lo recibido por encima de esas reservas queda como stock adicional físico.           |
+| No llegó el producto        | Stock no cambia; fulfilled=0 y toda la porción reservada por ese producto se libera al mismo canal.                                                                         |
+| Llegó producto equivocado   | Original recibido=0; sus reservas no cubiertas se liberan. El producto real aceptado se agrega como línea de compra no pedida, incrementa inventario y no cubre FIFO nuevo. |
+| Llegó producto no pedido    | Se agrega manualmente si se acepta; entra a inventario como stock adicional físico y no crea ni cumple allocations de reposición en CONFIRM_PURCHASE v0.1.                  |
 
 ## 15.4 Regla de cobertura al confirmar compra
 
-Para evitar volver a pedir mercancía que ya entró físicamente, la cantidad realmente comprada se usa para cubrir reposición del mismo producto, sucursal y canal. Se prioriza la cantidad reservada por el pedido origen; si sobra cantidad recibida y existen ventas nuevas pendientes del mismo canal, puede cubrirlas; el resto es stock extra. Una compra EFECTIVO jamás cubre pendientes TRANSFERENCIA y una compra TRANSFERENCIA jamás cubre pendientes EFECTIVO.
+Política A definitiva para CONFIRM_PURCHASE v0.1: la compra solo puede cumplir/liberar reservas que ya existían y pertenecían al purchase_order confirmado. La compra no usa mercancía excedente ni producto no pedido para cubrir demanda FIFO nueva que no fue reservada por CONFIRM_ORDER.
+
+CONFIRM_PURCHASE separa dos efectos:
+
+- Inventario físico: toda cantidad físicamente recibida y aceptada (`received_qty_base > 0`) puede incrementar inventario.
+- Reposición: solo puede considerarse fulfillment una cantidad que corresponda a una `replenishment_allocation` ya existente, creada por CONFIRM_ORDER para el purchase_order origen.
+
+Recibir mercancía no otorga automáticamente derecho a reducir demanda FIFO. CONFIRM_PURCHASE v0.1 no crea nuevas reservas de reposición, no amplía `reserved_qty_base`, no crea allocations para demanda nacida después del pedido, no crea `ORDER_RESERVE`, no agrega `purchase_order_items` retrospectivamente, no reclasifica `stock_extra` como replenishment y no reclasifica `customer_special` como replenishment. Las reservas pertenecen a CONFIRM_ORDER; la compra únicamente las resuelve mediante `fulfilled_qty_base` y `released_qty_base`.
+
+Como el MVP no permite recepciones parciales sucesivas y una compra confirmada cierra el pedido, al terminar CONFIRM_PURCHASE todas las reservas del purchase_order origen deben quedar completamente resueltas. Para cada `replenishment_allocation` del pedido, al finalizar exitosamente la compra debe cumplirse conceptualmente: `fulfilled_qty_base + released_qty_base = reserved_qty_base`. Es una invariante transaccional/de servicio sobre db-3; no requiere columna, constraint, trigger, tabla nueva ni db-4.
 
 <table>
 <colgroup>
@@ -1129,31 +1138,51 @@ Para evitar volver a pedir mercancía que ya entró físicamente, la cantidad re
 <thead>
 <tr class="header">
 <th>recibido = cantidad físicamente aceptada<br />
-1) cubrir reserva del pedido origen, siempre del mismo canal<br />
-2) cubrir pendientes nuevos del mismo producto + sucursal + canal (si la política lo permite)<br />
-3) el excedente restante = stock extra<br />
+1) cumplir únicamente reservations existentes del purchase_order origen, del mismo branch/product/channel<br />
+2) liberar la parte reservada del pedido que no pudo cubrirse<br />
+3) cualquier recibido restante incrementa inventario como stock adicional<br />
+4) no cubrir demanda nacida después del CONFIRM_ORDER<br />
+5) no crear reservas o allocations nuevas durante CONFIRM_PURCHASE<br />
 <br />
-Nunca usar excedente de EFECTIVO para cerrar pendientes de TRANSFERENCIA ni viceversa.</th>
+CASH nunca cubre TRANSFER y TRANSFER nunca cubre CASH. Con Política A tampoco se buscan pendientes nuevos del mismo canal.</th>
 </tr>
 </thead>
 <tbody>
 </tbody>
 </table>
 
+Si la cantidad recibida aplicable alcanza exactamente para la reserva existente, el inventario aumenta por lo recibido, la reserva queda fulfilled, `released_qty_base = 0`, la demanda cubierta disminuye según fulfillment y el committed correspondiente queda resuelto. No se crea una reserva nueva.
+
+Si existe reserva=10 y solo se reciben 6 aplicables, inventario += 6, `fulfilled_qty_base = 6`, `released_qty_base = 4`, la demanda baja solamente por las 6 efectivamente cubiertas, las 4 liberadas vuelven a quedar disponibles para pedido futuro y el pedido origen se cierra igualmente. No queda recepción parcial pendiente.
+
+Si existe reserva=10 y recibido=0, inventario no aumenta, `fulfilled_qty_base = 0`, `released_qty_base = 10`, la demanda comercial sigue pendiente, el compromiso del pedido queda liberado y el pedido se cierra.
+
+Si existe reserva=10 y recibido aceptado=15, inventario físico += 15; como máximo 10 pueden aplicarse al fulfillment de las reservas preexistentes. Las 5 restantes no cubren demanda FIFO nueva, no crean allocation, no crean `ORDER_RESERVE`, no generan fulfillment de ventas nuevas y quedan físicamente como stock adicional disponible. La demanda nueva, si existe, permanece pendiente.
+
+Cuando este documento diga que el excedente recibido queda como "stock extra" o "stock adicional", no significa modificar retrospectivamente `purchase_order_items.stock_extra_qty_base`. El purchase_order original es histórico. Significa únicamente cantidad físicamente aceptada que incrementó inventario pero que no se aplicó al fulfillment de una `replenishment_allocation` existente.
+
+Si una `purchase_order_item` ya tenía `stock_extra_qty_base > 0`, esa clasificación histórica permanece. Aunque después aparezca demanda nueva antes de recibir mercancía, CONFIRM_PURCHASE v0.1 no convierte esa cantidad en reposición; entra a inventario según lo efectivamente recibido, pero no crea allocations ni reduce demanda FIFO por esa razón.
+
+Si una `purchase_order_item` ya tenía `customer_special_qty_base > 0`, esa clasificación histórica también permanece. CONFIRM_PURCHASE no la reclasifica como reposición normal aunque al momento de recibir existan ventas pendientes del mismo producto; no crea allocation ni fulfillment FIFO nuevo por esa cantidad.
+
+Un producto aceptado con `purchase_order_item_id = NULL` puede registrarse en `purchase_items`, conservar producto/unidad/costo real, incrementar inventario por `received_qty_base` aceptado y participar en costo promedio según las reglas de compra. En CONFIRM_PURCHASE v0.1 no puede cubrir demanda FIFO pendiente, no crea `replenishment_allocation`, no crea `reserved_qty_base`, no crea `fulfilled_qty_base` de una allocation nueva, no crea `ORDER_RESERVE` y no genera fulfillment directo de demanda. Entra como stock físico adicional.
+
+Puede existir simultáneamente stock físico disponible y demanda de reposición pendiente si ese stock entró como excedente/no pedido y nunca tuvo reserva FIFO del pedido origen. Esto es válido en v0.1 y no debe reconciliarse automáticamente falseando allocations históricas. La UI/reportes futuros pueden mostrar ambos datos para evitar compras innecesarias.
+
 ## 15.5 Ejemplo completo
 
-| **Producto**            | **Pedido** | **Recibido** | **Efecto stock** | **Efecto reposición**                                |
-|-------------------------|------------|--------------|------------------|------------------------------------------------------|
-| Tira LED RGB            | 20         | 20           | +20              | Cubre hasta 20 pendientes aplicables.                |
-| Fuente 12V              | 10         | 8            | +8               | Cubre 8; 2 reservadas no recibidas se liberan.       |
-| Módulo LED              | 50         | 60           | +60              | Cubre pendientes; sobrante es extra.                 |
-| Controlador             | 5          | 0            | 0                | Libera 5 reservadas.                                 |
-| Tira Blanca (no pedida) | 0          | 20           | +20              | Puede cubrir pendientes de Tira Blanca; resto extra. |
+| **Producto**            | **Reserva/pedido aplicable** | **Recibido** | **Efecto stock** | **Efecto reposición**                                                      |
+|-------------------------|------------------------------|--------------|------------------|----------------------------------------------------------------------------|
+| Tira LED RGB            | 20                           | 20           | +20              | Si corresponde a reserva preexistente, fulfilled hasta 20 y release 0.      |
+| Fuente 12V              | 10                           | 8            | +8               | Fulfillment 8; release 2.                                                  |
+| Módulo LED              | 50                           | 60           | +60              | Como máximo 50 resuelven reservas existentes; 10 quedan stock adicional.    |
+| Controlador             | 5                            | 0            | 0                | Fulfillment 0; release 5.                                                  |
+| Tira Blanca (no pedida) | 0                            | 20           | +20              | Sin fulfillment de reposición; sin allocations; entra como stock adicional. |
 
 ## 15.6 Pedido original vs compra
 
-| **Auditoría** No se debe cambiar retrospectivamente el pedido de 50 a 60 solo porque llegaron 60. Pedido=50 y Compra=60. Esa diferencia es información útil y debe conservarse. |
-|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Auditoría** El purchase_order conserva exactamente lo que se pidió y los motivos originales. La purchase conserva lo que realmente llegó. Recibir más, menos o un producto diferente no reescribe `ordered_qty_base`, `replenishment_qty_base`, `customer_special_qty_base` ni `stock_extra_qty_base`. |
+|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 
 ## 15.7 Estados de compra
 
@@ -1433,7 +1462,7 @@ quote_items: id, quote_id, product_id, description_snapshot, unit_snapshot/unit_
 
 - RB-19. Si llega menos, lo faltante se libera para el siguiente pedido.
 
-- RB-20. Si llega más, entra todo lo aceptado; después de cubrir reposición, el excedente es stock extra.
+- RB-20. Si llega más, entra todo lo aceptado al inventario; solo las reservas preexistentes del pedido origen pueden quedar fulfilled y cualquier excedente sobre esas reservas permanece como stock adicional sin cubrir demanda nueva.
 
 - RB-21. Si llega un producto equivocado, el pedido original se conserva; la compra refleja el producto real aceptado.
 
@@ -1443,9 +1472,9 @@ quote_items: id, quote_id, product_id, description_snapshot, unit_snapshot/unit_
 
 - RB-24. Todo cambio de inventario produce un inventory_movement.
 
-- RB-25. Las reservas/coberturas de reposición se asignan FIFO internamente para trazabilidad.
+- RB-25. Las reservas/coberturas de reposición se asignan FIFO internamente para trazabilidad; CONFIRM_PURCHASE cumple las allocations FIFO ya existentes del pedido origen.
 
-- RB-26. Un producto recibido puede cubrir pendientes de reposición del mismo producto; el sobrante es inventario extra.
+- RB-26. En CONFIRM_PURCHASE v0.1 una compra solo cubre reposición mediante replenishment_allocations ya reservadas por el purchase_order origen. La mercancía excedente o no pedida incrementa inventario, pero no cubre pendientes FIFO nuevos ni crea reservas/allocations nuevas.
 
 - RB-27. El cierre de caja compara esperado vs declarado y conserva diferencia.
 
@@ -2155,7 +2184,7 @@ Las siguientes operaciones deberán implementarse como servicios transaccionales
 | Confirmar devolución         | Bloquear venta/items/inventario; verificar neto retornable; reingresar stock si aplica; reducir demanda hasta saldo; reembolso si efectivo; estado venta; auditoría.                                                       |
 | Confirmar pedido             | Bloquear posiciones de reposición; recalcular disponible; confirmar líneas; aumentar compromiso solo por replenishment_qty; ledger; estado CONFIRMED.                                                                      |
 | Cancelar pedido              | Liberar todo compromiso del pedido; ledger inverso; estado CANCELLED; auditoría.                                                                                                                                           |
-| Confirmar compra             | Bloquear pedido si aplica, inventarios y posiciones; tomar recibido real; aumentar stock; recalcular costo promedio; liberar todo compromiso; reducir demanda por cobertura real; cerrar pedido; auditoría.                |
+| Confirmar compra             | Bloquear pedido si aplica, inventarios y posiciones; tomar recibido real; aumentar stock; recalcular costo promedio; cumplir/liberar solo reservas existentes del pedido origen; cerrar pedido; auditoría.                |
 | Confirmar ajuste             | Bloquear saldo; calcular delta entre físico/sistema; movimiento de inventario; actualizar saldo; auditar motivo.                                                                                                           |
 | Confirmar traspaso           | Bloquear origen/destino en orden estable; validar origen; TRANSFER_OUT + TRANSFER_IN; costo de origen; recalcular promedio destino; auditar.                                                                               |
 | Abrir/cerrar caja            | Validar exclusividad según política; fondo inicial como movimiento; cierre calculado desde ledger; diferencias auditadas.                                                                                                  |
@@ -2195,9 +2224,9 @@ Las siguientes operaciones deberán implementarse como servicios transaccionales
 
 6. Liberar todo committed_qty asociado al pedido, aunque haya faltantes.
 
-7. Reducir demand_qty únicamente por min(recibido aplicable a reposición, replenishment planificado, demanda vigente).
+7. Reducir demand_qty únicamente por fulfillment de `replenishment_allocations` preexistentes del purchase_order origen.
 
-8. Toda cantidad recibida por encima de la cobertura es stock extra.
+8. Toda cantidad recibida por encima de esas reservas, o sin `purchase_order_item_id`, queda como stock físico adicional y no cubre demanda FIFO nueva.
 
 9. Confirmar compra y cerrar el pedido en la misma transacción; auditar y COMMIT.
 
