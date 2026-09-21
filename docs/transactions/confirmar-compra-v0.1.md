@@ -36,16 +36,18 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 - `expected_purchase_fingerprint`;
 - `request_hash`;
 - idempotencia;
+- permiso definitivo;
+- autorizacion completa;
 - estados base;
 - recuperacion historica;
 - estructura FASE A / FASE B / FASE C hasta el punto seguro definido.
 
 Este borrador todavia deja abiertos:
 
-- permiso definitivo;
-- autorizacion completa;
 - catalogo final de errores;
-- producto/unidad inactive;
+- supplier inactive;
+- product inactive;
+- unidad operativa;
 - `difference_reason`;
 - totales/impuestos;
 - inventory effects;
@@ -428,9 +430,63 @@ Reutilizar exactamente la politica temporal de `CONFIRM_ORDER`.
 
 No introducir otros tiempos.
 
-## 20. Catalogo minimo de errores
+## 19.1. Autorizacion, tenant y sucursal
 
-Este borrador define solo errores ya cerrados.
+Permiso funcional definitivo para ejecutar una nueva `CONFIRM_PURCHASE` o recuperar/reconciliar una ejecucion mediante nueva key / `IN_PROGRESS` recuperable:
+
+```text
+PURCHASES_CONFIRM
+```
+
+No se crea seed en este documento. La carga futura de `permissions.code = 'PURCHASES_CONFIRM'` es configuracion/implementacion y no requiere cambio de schema.
+
+Una nueva ejecucion de `CONFIRM_PURCHASE` exige:
+
+1. usuario actual con `users.status = 'ACTIVE'`;
+2. acceso explicito a `purchases.branch_id` mediante `user_branches(user_id, branch_id)`;
+3. al menos un rol valido/activo del mismo `business_id` que otorgue `permissions.code = 'PURCHASES_CONFIRM'` mediante la relacion fisica real `user_roles -> roles -> role_permissions -> permissions`.
+
+No autorizan por si solos:
+
+- `ADMIN`;
+- `MANAGER`;
+- `OWNER`;
+- nombre textual de `roles.code` o `roles.name`;
+- usuario que creo el `DRAFT`;
+- `purchases.received_by_user_id`;
+- cualquier privilegio implicito no modelado.
+
+La autorizacion funcional depende del permiso real `PURCHASES_CONFIRM`.
+
+`purchases.received_by_user_id` es dato historico del documento de recepcion. No autoriza confirmar, no obliga a que esa persona confirme, no sustituye al actor actual y no sustituye permiso.
+
+Al confirmar exitosamente, `purchases.confirmed_by_user_id` debe recibir el `user_id` del actor actual autorizado.
+
+La cadena autoritativa de tenant es:
+
+```text
+purchases.branch_id -> branches.business_id
+```
+
+El `business_id` de la operacion proviene del contexto autenticado y debe coincidir con la branch persistida. No se confia en un `business_id` libre enviado por cliente.
+
+`PURCHASE_NOT_FOUND` es la frontera segura de no divulgacion cuando `purchase_id` no existe o pertenece a otro tenant/business no visible para el actor/contexto. No se crea `PURCHASE_BUSINESS_MISMATCH` para ese caso.
+
+No se introduce `PURCHASE_BRANCH_MISMATCH` en `CONFIRM_PURCHASE v0.1`. `branch_id` no es una entrada independiente del comando; la branch autoritativa se deriva de `purchases.branch_id`. No se copia mecanicamente `PURCHASE_ORDER_BRANCH_MISMATCH`.
+
+Para una nueva ejecucion o `IN_PROGRESS` recuperable, la branch debe estar operativa/activa segun `branches.active`. Si no, devolver `BRANCH_INACTIVE`. Un replay historico `COMPLETED` con misma `idempotency_key` y mismo `request_hash` no debe fallar porque la branch quedo inactiva despues.
+
+`BRANCH_BUSINESS_MISMATCH` se usa solo cuando la branch ya pudo resolverse de forma segura dentro del contexto visible pero existe inconsistencia entre `branches.business_id` y el `business_id` autenticado esperado. Para recursos de otro tenant que no deben revelarse, usar `PURCHASE_NOT_FOUND`.
+
+`suppliers.business_id` debe coincidir con el business de `purchases.branch_id`. Si existe inconsistencia visible y segura, devolver `SUPPLIER_BUSINESS_MISMATCH`. Este micro-hito no cierra `SUPPLIER_INACTIVE`.
+
+Para cada `purchase_item`, `products.business_id` debe coincidir con el business de `purchases.branch_id`. Si no, devolver `PRODUCT_BUSINESS_MISMATCH`. Este micro-hito no cierra `PRODUCT_INACTIVE`.
+
+La FK fisica `purchase_items(product_unit_id, product_id) -> product_units(id, product_id)` protege que la unidad pertenezca al mismo producto. No se cierra todavia un error funcional definitivo por unidad inactive/operativa y no se agrega `PRODUCT_UNIT_INVALID` al catalogo cerrado.
+
+## 20. Catalogo de errores cerrado hasta este micro-hito
+
+Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto porque faltan decisiones sobre supplier inactive, product inactive, unidad operativa, `difference_reason`, totales/impuestos, inventario, costo y replenishment.
 
 Idempotencia:
 
@@ -447,13 +503,32 @@ Purchase order:
 
 - `PURCHASE_ORDER_STATUS_INVALID`.
 
+Autorizacion:
+
+- `USER_INACTIVE`;
+- `USER_BRANCH_FORBIDDEN`;
+- `USER_PERMISSION_DENIED`.
+
+Branch / business:
+
+- `BRANCH_INACTIVE`;
+- `BRANCH_BUSINESS_MISMATCH`.
+
+Supplier / business:
+
+- `SUPPLIER_BUSINESS_MISMATCH`.
+
+Product / business:
+
+- `PRODUCT_BUSINESS_MISMATCH`.
+
 No se crean todavia errores de:
 
-- autorizacion;
-- branch/business;
-- supplier;
-- producto;
-- unidad;
+- `PURCHASE_BRANCH_MISMATCH`;
+- `PURCHASE_BUSINESS_MISMATCH`;
+- `SUPPLIER_INACTIVE`;
+- `PRODUCT_INACTIVE`;
+- `PRODUCT_UNIT_INVALID`;
 - `difference_reason`;
 - totales;
 - inventario;
@@ -468,7 +543,7 @@ No se crea `PURCHASE_EMPTY` ni equivalente.
 
 `PURCHASE_IDEMPOTENCY_IN_PROGRESS` ocurre cuando existe la misma key/hash con lease vigente.
 
-`PURCHASE_NOT_FOUND` ocurre cuando `purchase_id` no corresponde a una `purchase` visible/valida para la operacion segun la frontera de seguridad que se cierre despues. Este borrador no define autorizacion completa.
+`PURCHASE_NOT_FOUND` ocurre cuando `purchase_id` no corresponde a una `purchase` visible/valida para la operacion. Tambien se usa como frontera segura de no divulgacion cuando el recurso pertenece a otro tenant/business no visible para el actor/contexto.
 
 `PURCHASE_STATUS_INVALID` ocurre cuando la `purchase` existe pero su estado no es confirmable y no corresponde a reconciliacion historica segura. Ejemplo directo: `CANCELLED`.
 
@@ -479,7 +554,25 @@ No se crea `PURCHASE_EMPTY` ni equivalente.
 
 `PURCHASE_ORDER_STATUS_INVALID` ocurre cuando la `purchase` esta `DRAFT` pero el `purchase_order` relacionado no esta en `CONFIRMED`, que es el estado requerido para ejecutar una nueva confirmacion.
 
+`USER_INACTIVE` ocurre cuando el actor actual no cumple `users.status = 'ACTIVE'` para una ejecucion nueva o recuperable. No aplica a replay historico de misma key/hash en `COMPLETED` o `FAILED`.
+
+`USER_BRANCH_FORBIDDEN` ocurre cuando el actor no tiene acceso explicito a `purchases.branch_id` mediante `user_branches`. Es autorizacion del usuario y no debe confundirse con `BRANCH_BUSINESS_MISMATCH`.
+
+`USER_PERMISSION_DENIED` ocurre cuando el usuario tiene acceso a la branch pero no posee `PURCHASES_CONFIRM` mediante un rol valido del mismo business. No existe bypass por nombre de rol.
+
+`BRANCH_INACTIVE` ocurre cuando la branch de la `purchase` no esta operativa/activa para una ejecucion nueva o recuperable. No aplica a replay historico de misma key/hash en `COMPLETED`.
+
+`BRANCH_BUSINESS_MISMATCH` ocurre cuando la branch ya pudo resolverse de forma segura dentro del contexto visible, pero `branches.business_id` no coincide con el `business_id` autenticado esperado. Para recursos de otro tenant no visible, usar `PURCHASE_NOT_FOUND`.
+
+`SUPPLIER_BUSINESS_MISMATCH` ocurre cuando la `purchase`/pedido referencia un supplier cuya pertenencia empresarial no coincide con el business autoritativo de la branch. Es inconsistencia multiempresa y no debe confundirse con supplier inactive.
+
+`PRODUCT_BUSINESS_MISMATCH` ocurre cuando al menos una `purchase_item` referencia un producto cuyo business no coincide con el business de la branch de la `purchase`. Es inconsistencia multiempresa y no debe confundirse con product inactive.
+
 Los errores de idempotencia se resuelven por contrato de la key. No deben mezclarse mecanicamente con errores operativos de FASE B.
+
+No se crea `PURCHASE_BRANCH_MISMATCH` porque `branch_id` no es entrada independiente del comando.
+
+No se crean todavia `SUPPLIER_INACTIVE`, `PRODUCT_INACTIVE` ni `PRODUCT_UNIT_INVALID`.
 
 ## 22. Estados purchases
 
@@ -572,6 +665,12 @@ devolver o reconstruir el resultado historico.
 
 No:
 
+- revalidar `users.status = 'ACTIVE'`;
+- revalidar `user_branches`;
+- revalidar `PURCHASES_CONFIRM`;
+- revalidar `branches.active`;
+- revalidar supplier active;
+- revalidar product active;
 - reautorizar para ese replay historico exacto;
 - repetir locks de negocio innecesarios;
 - repetir inventario;
@@ -589,6 +688,8 @@ Si existe:
 devolver el error de dominio almacenado.
 
 No reintentar automaticamente.
+
+No reevaluar autorizacion actual, estado actual del `DRAFT` ni catalogos actuales.
 
 Una key `FAILED` historica nunca se transforma posteriormente en `COMPLETED` porque otra key haya confirmado la misma `purchase`.
 
@@ -631,14 +732,22 @@ Debe recuperarse de forma segura:
 
 ## 31. Autorizacion cross-key
 
-Todavia no se define permiso exacto.
-
-Regla congelada para este borrador:
+Regla definitiva para este borrador:
 
 - SAME TERMINAL KEY: `COMPLETED`/`FAILED` historica conserva su propio contrato.
-- NUEVA KEY o `IN_PROGRESS` recuperable: si encuentra `purchase` ya `CONFIRMED` + `purchase_order` `CLOSED`, no puede reconciliar hacia `COMPLETED` hasta validar tenant/business, scope y autorizacion actual.
+- NUEVA KEY o `IN_PROGRESS` recuperable: antes de ejecutar efectos o reconciliar una `purchase` ya confirmada debe validar autorizacion actual.
 
-El detalle del permiso se cerrara despues.
+Para una nueva `idempotency_key` o `IN_PROGRESS` recuperable, validar en este orden conceptual antes de continuar con `DRAFT` o reconciliar `CONFIRMED + CLOSED` historico:
+
+1. tenant/business visible;
+2. branch valida/activa cuando aplique;
+3. `users.status = 'ACTIVE'`;
+4. acceso mediante `user_branches`;
+5. permiso funcional `PURCHASES_CONFIRM`.
+
+Solo despues puede continuar con `purchase DRAFT + order CONFIRMED` o reconciliar una confirmacion historica `purchase CONFIRMED + order CLOSED`.
+
+Esto impide usar una nueva key como bypass para leer o reconciliar una `purchase` a la que el actor ya no tiene acceso.
 
 ## 32. FASE previa de resolucion
 
@@ -703,18 +812,25 @@ Por ahora queda congelado solamente este prefijo:
 3. Bloquear `purchase_orders(id) FOR UPDATE`.
 4. Bloquear `purchases(id) FOR UPDATE`.
 5. Revalidar `purchase_order_id`, `branch_id`, `supplier_id` y `replenishment_channel` contra el pre-read.
-6. Validar estado `purchase`/`purchase_order`.
-7. Resolver reconciliacion historica si corresponde.
-8. Si camino normal: `purchase DRAFT + order CONFIRMED`.
-9. Bloquear/leer `purchase_items` por `line_number ASC, id ASC`.
-10. Recalcular purchase fingerprint autoritativo.
-11. Comparar contra `expected_purchase_fingerprint`.
-12. Si difiere, rechazar con `PURCHASE_DRAFT_STALE`.
-13. Ejecutar posteriormente las validaciones de dominio todavia pendientes.
-14. Ejecutar posteriormente effects/locks de inventario/reposicion todavia pendientes.
-15. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
+6. Validar tenant/business visible.
+7. Validar branch: `branches.active` y pertenencia a `business_id` autenticado segun la frontera segura definida.
+8. Validar `users.status = 'ACTIVE'`.
+9. Validar acceso a `purchases.branch_id` mediante `user_branches`.
+10. Validar permiso funcional `PURCHASES_CONFIRM` mediante `user_roles -> roles -> role_permissions -> permissions`.
+11. Resolver estados/reconciliacion historica si corresponde.
+12. Si camino normal: `purchase DRAFT + order CONFIRMED`.
+13. Bloquear/leer `purchase_items` por `line_number ASC, id ASC`.
+14. Validar `SUPPLIER_BUSINESS_MISMATCH` si el supplier no pertenece al business de la branch.
+15. Validar `PRODUCT_BUSINESS_MISMATCH` si alguna linea referencia producto de otro business.
+16. Recalcular purchase fingerprint autoritativo.
+17. Comparar contra `expected_purchase_fingerprint`.
+18. Ejecutar posteriormente las validaciones de dominio todavia pendientes.
+19. Ejecutar posteriormente effects/locks de inventario/reposicion todavia pendientes.
+20. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
 
-No se rellenan ahora los pasos 13-15 con diseno inventado.
+No se introducen todavia locks de inventario/reposicion. No se define todavia supplier active, product active, unidad operativa, `difference_reason` ni totales/impuestos.
+
+La consistencia supplier/product business puede validarse antes del fingerprint porque protege tenant/integridad. Las politicas funcionales abiertas no se inventan en este prefijo.
 
 ## 35. Reconciliacion historica
 
@@ -778,16 +894,32 @@ No guardar en `error_message`:
 - stack trace;
 - secretos;
 - fingerprint completo;
-- request_hash completo.
+- request_hash completo;
+- datos que revelen otro tenant.
 
 Errores deterministicos de este micro-hito que pueden llegar a FASE C:
 
 - `PURCHASE_NOT_FOUND` cuando aplique despues de reservar key y el scope fisico permita representarlo;
 - `PURCHASE_STATUS_INVALID`;
 - `PURCHASE_DRAFT_STALE`;
-- `PURCHASE_ORDER_STATUS_INVALID`.
+- `PURCHASE_ORDER_STATUS_INVALID`;
+- `USER_INACTIVE`;
+- `USER_BRANCH_FORBIDDEN`;
+- `USER_PERMISSION_DENIED`;
+- `BRANCH_INACTIVE`;
+- `BRANCH_BUSINESS_MISMATCH`;
+- `SUPPLIER_BUSINESS_MISMATCH`;
+- `PRODUCT_BUSINESS_MISMATCH`.
 
 `PURCHASE_IDEMPOTENCY_KEY_REUSED` y `PURCHASE_IDEMPOTENCY_IN_PROGRESS` pertenecen al contrato de la key y no son errores operativos de FASE B.
+
+Tampoco pasan por FASE C:
+
+- replay `COMPLETED`;
+- replay `FAILED`;
+- fallos tecnicos no deterministicos.
+
+FASE C conserva el `error_code` original.
 
 ## 38. Fallos tecnicos
 
@@ -850,19 +982,22 @@ No sustituye idempotencia porque no guarda:
 Este micro-hito no requiere:
 
 - columna;
+- FK;
 - version;
 - trigger;
 - constraint;
+- enum;
 - `request_hash` en `purchases`;
 - `client_operation_id NOT NULL`;
 - indice obligatorio;
 - db-4.
 
+El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no evolucion fisica del modelo.
+
 ## 43. Puntos pendientes antes del freeze
 
 Antes de congelar `CONFIRM_PURCHASE v0.1`, faltan:
 
-- autorizacion/permiso;
 - catalogo completo de errores;
 - reglas de productos/unidades;
 - `difference_reason`;
@@ -881,6 +1016,11 @@ No quedan como pendientes en este borrador:
 - identidad;
 - fingerprint;
 - idempotencia;
+- autorizacion;
+- permiso `PURCHASES_CONFIRM`;
+- frontera tenant;
+- acceso de sucursal;
+- errores business cerrados en este micro-hito;
 - folio de confirmacion;
 - parent mutex;
 - inmutabilidad purchase/order;
