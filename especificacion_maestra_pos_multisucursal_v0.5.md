@@ -1129,6 +1129,39 @@ CONFIRM_PURCHASE separa dos efectos:
 
 Recibir mercancía no otorga automáticamente derecho a reducir demanda FIFO. CONFIRM_PURCHASE v0.1 no crea nuevas reservas de reposición, no amplía `reserved_qty_base`, no crea allocations para demanda nacida después del pedido, no crea `ORDER_RESERVE`, no agrega `purchase_order_items` retrospectivamente, no reclasifica `stock_extra` como replenishment y no reclasifica `customer_special` como replenishment. Las reservas pertenecen a CONFIRM_ORDER; la compra únicamente las resuelve mediante `fulfilled_qty_base` y `released_qty_base`.
 
+Regla funcional REPLENISHMENT-FIRST para recepcion parcial: si una `purchase_order_item` mezcla `replenishment_qty_base`, `customer_special_qty_base` y/o `stock_extra_qty_base`, y lo fisicamente recibido es menor que `ordered_qty_base`, la cantidad recibida se considera primero aplicable a la porcion historica `REPLENISHMENT` solo para determinar cuanta mercancia recibida puede intentar resolver las `replenishment_allocations` preexistentes del order item.
+
+Formula:
+
+```text
+total_received_base =
+  COALESCE(
+    SUM(purchase_items.received_qty_base asociadas al order_item),
+    0
+  )
+
+received_applicable_to_replenishment_base =
+  MIN(
+    total_received_base,
+    purchase_order_items.replenishment_qty_base
+  )
+```
+
+Esta formula es un cap de elegibilidad de recepcion. No significa automaticamente que `fulfilled_qty_base = received_applicable_to_replenishment_base`: el fulfillment real seguira limitado por reservations preexistentes, demanda realmente pendiente, reglas por `sale_item` y devoluciones `RESTOCK` posteriores al pedido. Tampoco modifica retrospectivamente `replenishment_qty_base`, `customer_special_qty_base`, `stock_extra_qty_base` ni `ordered_qty_base` del pedido.
+
+Ejemplos:
+
+- `replenishment = 5`, `stock_extra = 5`, `received = 5` => `received_applicable_to_replenishment_base = 5`.
+- `replenishment = 5`, `stock_extra = 5`, `received = 8` => `received_applicable_to_replenishment_base = 5`; las otras 3 unidades no crean allocations, no cubren demanda FIFO nueva y quedan fuera del efecto de reposicion de este micro-hito.
+- `replenishment = 5`, `customer_special = 5`, `received = 3` => `received_applicable_to_replenishment_base = 3`.
+- `replenishment = 0`, `stock_extra = 10`, `received = 6` => `received_applicable_to_replenishment_base = 0`; no hay efecto de reposicion por esa linea.
+
+Si despues del pedido desaparece parte de la demanda por una devolucion `RESTOCK`, la cantidad recibida aplicable a replenishment no obliga a fulfillarla. Por ejemplo, `replenishment = 5` y `received = 5` producen `received_applicable_to_replenishment_base = 5`, pero si la demanda real posterior queda en 3, el futuro bloque de demand-cap podra determinar `fulfilled <= 3` y la parte no fulfillable de las reservations se resolvera por la futura regla de release.
+
+No se define prioridad nueva entre `CUSTOMER_SPECIAL` y `STOCK_EXTRA`; para esta regla ambos son motivos non-replenishment. Una `purchase_item` con `purchase_order_item_id IS NULL` no participa en esta formula y conserva la politica de producto no pedido: sin allocation nueva, sin fulfillment, sin `ORDER_RESERVE` y sin cobertura de demanda nueva.
+
+Esta regla es funcional/transaccional y no requiere columna, constraint, trigger, indice, tabla ni db-4.
+
 Como el MVP no permite recepciones parciales sucesivas y una compra confirmada cierra el pedido, al terminar CONFIRM_PURCHASE todas las reservas del purchase_order origen deben quedar completamente resueltas. Para cada `replenishment_allocation` del pedido, al finalizar exitosamente la compra debe cumplirse conceptualmente: `fulfilled_qty_base + released_qty_base = reserved_qty_base`. Es una invariante transaccional/de servicio sobre db-3; no requiere columna, constraint, trigger, tabla nueva ni db-4.
 
 <table>

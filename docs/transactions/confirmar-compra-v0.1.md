@@ -570,6 +570,53 @@ Si no existe ninguna `purchase_item` asociada a un `purchase_order_item`, el rec
 
 Si `total_received_base = ordered_base`, no existe diferencia cuantitativa agregada. Si `total_received_base < ordered_base`, existe faltante. Si `total_received_base > ordered_base`, existe excedente respecto de lo pedido. Esto no modifica Politica A de reposicion.
 
+### Prioridad de recepcion parcial para replenishment
+
+`CONFIRM_PURCHASE v0.1` adopta la regla funcional REPLENISHMENT-FIRST para determinar cuanta cantidad recibida de un `purchase_order_item` mixto puede intentar resolver sus `replenishment_allocations` preexistentes.
+
+Para cada `purchase_order_item` del pedido origen:
+
+```text
+total_received_base =
+  COALESCE(
+    SUM(purchase_items.received_qty_base asociadas al order_item),
+    0
+  )
+
+received_applicable_to_replenishment_base =
+  MIN(
+    total_received_base,
+    purchase_order_items.replenishment_qty_base
+  )
+```
+
+`received_applicable_to_replenishment_base` es un cap de elegibilidad de recepcion para reposicion. Define solo que parte de lo fisicamente recibido puede intentar aplicarse a allocations preexistentes del mismo `purchase_order_item`.
+
+No significa automaticamente:
+
+```text
+fulfilled_qty_base = received_applicable_to_replenishment_base
+```
+
+El fulfillment real queda pendiente y debera limitarse posteriormente por reservations preexistentes, demanda realmente pendiente, reglas por `sale_item`, devoluciones `RETURN_RESTOCK` posteriores al pedido y la futura regla de release.
+
+La regla no modifica retrospectivamente `purchase_order_items.replenishment_qty_base`, `customer_special_qty_base`, `stock_extra_qty_base` ni `ordered_qty_base`. Tampoco reclasifica `stock_extra` o `customer_special` como replenishment; ambos son motivos non-replenishment para este calculo.
+
+Ejemplos:
+
+- `replenishment = 5`, `stock_extra = 5`, `received = 5` => `received_applicable_to_replenishment_base = 5`.
+- `replenishment = 5`, `stock_extra = 5`, `received = 8` => `received_applicable_to_replenishment_base = 5`; las otras 3 unidades no crean allocations, no cubren demanda FIFO nueva, no aumentan el limite de fulfillment del pedido origen y quedan para el futuro bloque de inventario.
+- `replenishment = 5`, `customer_special = 5`, `received = 3` => `received_applicable_to_replenishment_base = 3`.
+- `replenishment = 0`, `stock_extra = 10`, `received = 6` => `received_applicable_to_replenishment_base = 0` y no hay efecto de reposicion por esa linea.
+
+Si `total_received_base = 0`, entonces `received_applicable_to_replenishment_base = 0`. Una `purchase_item` con `purchase_order_item_id IS NULL` no participa en esta formula y conserva la politica de producto no pedido: no crea allocation, no genera fulfillment, no crea `ORDER_RESERVE` y no cubre demanda nueva.
+
+Si una devolucion posterior al pedido redujo la demanda real, esta regla no obliga a fulfillar todo lo recibido aplicable. Ejemplo: `replenishment historico = 5` y `received = 5` establecen `received_applicable_to_replenishment_base = 5`; si por `RETURN_RESTOCK` posterior solo queda demanda real `3`, el futuro bloque de demand-cap podra determinar `fulfilled <= 3` y resolver la parte no fulfillable segun la futura regla de release.
+
+Politica A se mantiene completa: esta regla no autoriza crear allocations, ampliar reservations, cubrir demanda nueva, reasignar exceso ni buscar otro `sale_item` FIFO nuevo.
+
+Esta regla es funcional/transaccional y no requiere columna, constraint, trigger, indice, tabla ni db-4.
+
 Si `purchase_order_item_id IS NOT NULL`, `product_id` debe corresponder al producto de esa linea del pedido. db-3 lo protege mediante FK compuesta. Un producto equivocado no se representa apuntando la nueva mercancia al `order_item` original; debe representarse como linea original con recibido cero o faltante y nueva `purchase_item` con `purchase_order_item_id = NULL`.
 
 No es obligatorio que `purchase_item.product_unit_id = purchase_order_item.product_unit_id`. Puede recibirse el mismo producto en una presentacion distinta. Lo obligatorio es mismo `product_id`, `product_unit` perteneciente al producto, `factor_to_base_snapshot` valido y `received_qty_base` coherente. No modificar el pedido historico.
@@ -1334,6 +1381,13 @@ El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no
 Antes de congelar `CONFIRM_PURCHASE v0.1`, faltan:
 
 - fulfillment/release;
+- demand cap por `sale_item`;
+- `RETURN_RESTOCK` posterior al pedido;
+- multiples purchase_orders sobre el mismo `sale_item`;
+- orden de resolucion de allocations;
+- `purchase_item_id` en allocations;
+- multiples `purchase_items` por `purchase_order_item`;
+- movements y positions de reposicion;
 - inventory effects;
 - costo promedio;
 - orden global de locks;
