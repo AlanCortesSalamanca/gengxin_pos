@@ -39,11 +39,13 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 - permiso definitivo;
 - autorizacion completa;
 - politica historica de supplier/product/unit;
+- contrato fiscal historico `tax_snapshot` v1 para compras (adoptado/cerrado);
 - autoridad de cantidades;
 - consistencia `received_qty` -> `received_qty_base`;
 - `difference_reason`;
 - costo real de linea;
 - subtotal de linea;
+- derivacion/revalidacion fiscal de `tax_total` desde `tax_snapshot` v1;
 - total de linea;
 - sumatorias de cabecera;
 - errores de validacion del `DRAFT` cerrados hasta este micro-hito;
@@ -53,9 +55,6 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 
 Este borrador todavia deja abiertos:
 
-- contrato exacto de `tax_snapshot` de compras;
-- derivacion/revalidacion fiscal exacta de `tax_total` desde `tax_snapshot`;
-- catalogo final de errores solo en lo que dependa de esa decision fiscal;
 - inventory effects;
 - costo promedio;
 - replenishment fulfillment/release detallado;
@@ -376,6 +375,17 @@ Reglas:
 - NUMERIC normalizado semanticamente;
 - `1`, `1.0` y `1.0000` representan el mismo valor semantico.
 
+Para `purchase_items.tax_snapshot` con `schema_version = 1`, aplicar ademas el contrato compartido `docs/domain/tax-snapshot-v1.md`:
+
+- validar shape estricto antes de usarlo;
+- keys top-level en orden determinista;
+- keys de `components` en orden determinista;
+- `NULL` explicito;
+- numeros normalizados semanticamente;
+- `components` ordenados semanticamente por `tax_code ASC`, `factor_type ASC`, `rate ASC`, `amount ASC`, `base ASC` para fingerprint/canonicalizacion.
+
+El array persistido no necesita guardarse fisicamente ordenado. La canonicalizacion normaliza el array sin hacer `UPDATE` solo para reordenar JSON.
+
 No se congela algoritmo criptografico especifico en este documento.
 
 ## 17. request_hash
@@ -505,6 +515,12 @@ La FK fisica `purchase_items(product_unit_id, product_id) -> product_units(id, p
 
 Despues del fingerprint, `CONFIRM_PURCHASE` recalcula, revalida, compara y rechaza. No corrige silenciosamente el `DRAFT` para hacerlo valido.
 
+### Validacion del snapshot fiscal v1
+
+La validacion del snapshot fiscal usa el contrato compartido `docs/domain/tax-snapshot-v1.md` como `PURCHASE TAX SNAPSHOT v1`. Esta validacion no es pendiente: el snapshot se valida completamente antes de continuar con efectos. Los errores de estructura o semantica del snapshot fiscal se rechazan con `PURCHASE_TAX_INVALID`.
+
+No se reconsulta `tax_profiles`, `products` ni configuracion fiscal vigente para reescribir la compra historica. El snapshot persistido es la autoridad.
+
 ### Autoridad historica de cantidad
 
 `purchase_items.factor_to_base_snapshot` es la autoridad historica de conversion de la linea. No usar el factor actual del catalogo durante confirmacion. Debe cumplirse `factor_to_base_snapshot > 0` segun modelo fisico y la confirmacion no reescribe este factor.
@@ -598,7 +614,7 @@ purchase.total = 0
 
 ### Costo real y subtotales
 
-`purchase_items.actual_unit_cost_base` es el costo real aceptado de la recepcion en unidad base. No sustituir por `expected_unit_cost_base` del pedido, `product_suppliers.cost_reference`, costo de catalogo vigente, costo promedio actual ni ningun costo recalculado arbitrariamente. Debe ser `>= 0` segun modelo fisico.
+`purchase_items.actual_unit_cost_base` es el costo real aceptado de la recepcion en unidad base. Para `CONFIRM_PURCHASE v0.1`, significa costo unitario neto antes de impuestos. No sustituir por `expected_unit_cost_base` del pedido, `product_suppliers.cost_reference`, costo de catalogo vigente, costo promedio actual ni ningun costo recalculado arbitrariamente. Debe ser `>= 0` segun modelo fisico.
 
 `actual_unit_cost_base = 0` es valido en v0.1. Puede representar bonificacion, muestra, reposicion gratuita u otro caso real autorizado. No crear error por costo cero ni inventar una politica comercial adicional.
 
@@ -614,15 +630,104 @@ Debe cumplirse `purchase_items.subtotal = expected_subtotal`. Si no coincide, de
 
 ### tax_snapshot y tax_total
 
+`CONFIRM_PURCHASE v0.1` adopta el contrato compartido `docs/domain/tax-snapshot-v1.md` como `PURCHASE TAX SNAPSHOT v1`.
+
 `purchase_items.tax_snapshot` es snapshot historico persistido del `DRAFT`. `CONFIRM_PURCHASE` no debe reemplazarlo porque cambio `tax_profile`, catalogo fiscal o configuracion posterior. No consultar catalogo vigente para reescribir la compra historica.
 
-Este micro-hito no declara una formula completa para derivar `tax_total` desde `tax_snapshot`. La estructura contractual exacta de `tax_snapshot` de compras y las reglas para uno o multiples impuestos todavia no estan definidas con suficiente precision.
+El snapshot v1 es un objeto JSON estricto con exactamente estas keys top-level:
 
-Por tanto este micro-hito no afirma nombres de keys JSON, tasa exacta, base exacta, lista de impuestos, formula de IVA, retenciones, redondeo por impuesto ni que `{}` implique necesariamente una semantica fiscal concreta salvo que una fuente autoritativa lo defina explicitamente.
+```json
+{
+  "schema_version": 1,
+  "source_tax_profile_id": null,
+  "tax_object": null,
+  "treatment": "NO_TAX",
+  "calculation_basis": "EXCLUSIVE",
+  "components": []
+}
+```
 
-Hasta cerrar `tax_snapshot`, `purchase_items.tax_total` sigue siendo valor persistido del `DRAFT` incluido en fingerprint. Debe ser `>= 0` por modelo fisico. `CONFIRM_PURCHASE` todavia no puede certificar completamente que `tax_total` fue derivado correctamente desde `tax_snapshot`, pero si puede validar relaciones aritmeticas que no dependan de conocer la estructura interna del snapshot.
+No se permiten keys top-level adicionales ni numeros representados como strings. `schema_version` debe ser JSON integer exactamente `1`.
 
-No se crea `PURCHASE_TAX_INVALID` en este micro-hito. La razon no es que el impuesto nunca necesite error independiente, sino que el contrato de `tax_snapshot` todavia no esta suficientemente definido para establecer una semantica publica estable.
+`source_tax_profile_id` es trazabilidad historica: JSON integer positivo o `null`. No hay FK desde el JSON y no convierte al `tax_profile` vivo en autoridad historica.
+
+`tax_object` conserva el valor historico de `tax_profiles.tax_object` cuando aplique. Puede ser string o `null`. Si es string no debe estar vacio, contener solo espacios ni tener whitespace inicial/final. v1 no interpreta legalmente ese valor ni consulta catalogo SAT vivo.
+
+`treatment` debe ser uno de:
+
+- `TAXED`;
+- `ZERO_RATE`;
+- `EXEMPT`;
+- `NO_TAX`.
+
+`calculation_basis` debe ser `EXCLUSIVE`. Esto significa que `purchase_items.subtotal` es neto, el impuesto se calcula despues y `purchase_items.total = purchase_items.subtotal + purchase_items.tax_total`. v1 no soporta costo tax-inclusive.
+
+Cada elemento de `components` debe ser objeto estricto con exactamente:
+
+- `tax_code`;
+- `factor_type`;
+- `rate`;
+- `base`;
+- `amount`.
+
+Reglas de componente v1:
+
+- `tax_code` es string obligatorio, no vacio, no solo espacios y sin whitespace inicial/final; no se fuerza uppercase, no se cambia case, no se mapea ni se consulta catalogo vivo;
+- `factor_type` debe ser `RATE`;
+- `rate` debe ser JSON number, decimal exacto conceptual, `0 <= rate <= 1`;
+- `base` debe ser JSON number no negativo con semantica monetaria de 2 decimales y debe cumplir `base = purchase_items.subtotal`;
+- `amount` debe ser JSON number no negativo con semantica monetaria de 2 decimales y debe cumplir `amount = ROUND(purchase_items.subtotal * rate, 2)`.
+
+No usar `FLOAT`, `DOUBLE` ni tipos binarios como autoridad fiscal. Para dinero usar `ROUND(value, 2)` compatible con PostgreSQL `NUMERIC`; para valores no negativos, los empates se alejan de cero, equivalente operacionalmente a `HALF_UP` en este dominio.
+
+`components` tiene semantica de conjunto para calculo/canonicalizacion. En v1 esta prohibido repetir la misma triple semantica `(tax_code, factor_type, rate)`, aunque `amount` sea igual o diferente.
+
+v1 permite multiples componentes, todos `RATE`, todos con `base = purchase_items.subtotal`, todos no negativos, sin dependencias entre componentes y sin duplicar la triple semantica. No hay maximo artificial distinto de limites tecnicos razonables del documento JSON.
+
+Reglas por `treatment`:
+
+- `TAXED`: `components.length >= 1`, todos `rate > 0`, `base = subtotal`, `amount = ROUND(subtotal * rate, 2)`; no se permite `rate = 0`.
+- `ZERO_RATE`: `components.length >= 1`, todos `rate = 0`, `base = subtotal`, `amount = 0`, `tax_total = 0`; conserva documentalmente tasa 0.
+- `EXEMPT`: `components = []` y `tax_total = 0`.
+- `NO_TAX`: `components = []` y `tax_total = 0`.
+
+`EXEMPT` y `NO_TAX` son tratamientos historicos distintos aunque ambos produzcan impuesto cero.
+
+Para `schema_version = 1`, no se mezclan componentes positivos y componentes `rate = 0` en una misma linea: `TAXED` exige todos positivos, `ZERO_RATE` exige todos cero, `EXEMPT` y `NO_TAX` no tienen componentes.
+
+El impuesto esperado de linea es:
+
+```text
+expected_tax_total = SUM(component.amount)
+```
+
+La suma vacia conceptual es `0`. Debe cumplirse:
+
+```text
+purchase_items.tax_total = expected_tax_total
+```
+
+Si no coincide, devolver `PURCHASE_TAX_INVALID`.
+
+`{}` no es `tax_snapshot` valido para confirmar una `purchase_item`. Puede existir fisicamente mientras se construye el `DRAFT` porque la columna tiene `DEFAULT '{}'::jsonb`, pero antes de `CONFIRM_PURCHASE` toda `purchase_item` debe tener snapshot v1 explicito. Si `tax_snapshot = {}`, devolver `PURCHASE_TAX_INVALID`.
+
+Una `purchase` sin `purchase_items` no tiene snapshot que validar. En ese caso sus headers deben ser cero segun la regla de compra sin lineas.
+
+Si `received_qty_base = 0`, entonces `subtotal = 0` y las reglas fiscales v1 obligan naturalmente a `tax_total = 0`: `TAXED` y `ZERO_RATE` usan `base = 0` y `amount = 0`, mientras `EXEMPT` y `NO_TAX` no tienen componentes. Si una linea con `received_qty_base = 0` conserva impuesto positivo o inconsistente, devolver `PURCHASE_TAX_INVALID`.
+
+`purchase_order_items.tax_snapshot` puede servir como valor inicial al crear/editar el `purchase DRAFT`, pero `purchase_items.tax_snapshot` es la autoridad fiscal real de la recepcion. Puede diferir antes de confirmar. `CONFIRM_PURCHASE` no exige igualdad entre ambos, no modifica `purchase_order_items` y no reescribe historia del pedido.
+
+Para `purchase_order_item_id IS NULL`, el flujo de creacion/edicion del `DRAFT` puede inicializar `tax_snapshot` desde `products.tax_profile_id -> tax_profiles` vigente en ese momento, o desde otra captura valida futura. Una vez persistido y revisado, `purchase_items.tax_snapshot` es la autoridad. `CONFIRM_PURCHASE` no lo sustituye consultando catalogo vivo.
+
+`product inactive`, `tax_profile inactive` posterior y cambio posterior de `products.tax_profile_id` no invalidan un snapshot historico v1 valido.
+
+Un snapshot v1 valido debe poder interpretarse historicamente usando `purchase_items.subtotal`, `purchase_items.tax_snapshot`, `purchase_items.tax_total` y `purchase_items.total`, sin consultar `tax_profiles`, `products` ni configuracion fiscal vigente.
+
+`schema_version` determina las reglas de interpretacion. Si en el futuro existe v2, no modifica semantica v1, no reinterpreta documentos v1 y no migra destructivamente snapshots historicos.
+
+Una key historica `COMPLETED` o `FAILED` no reinterpreta el snapshot contra perfiles actuales, catalogos actuales ni reglas futuras.
+
+v1 no soporta retenciones, impuestos negativos, impuesto incluido en costo, cuota fija, bases fiscales encadenadas, reglas fiscales SAT completas ni generacion de CFDI. Una necesidad futura de withholding o soporte fiscal mas amplio requiere diseno formal separado.
 
 ### Totales de linea y cabecera
 
@@ -645,9 +750,7 @@ purchases.total = purchases.subtotal + purchases.tax_total
 
 Si no hay lineas, la suma conceptual es `0` para subtotal, impuesto y total. Si no coincide, devolver `PURCHASE_TOTALS_INVALID`.
 
-La consistencia agregada `purchases.tax_total = SUM(purchase_items.tax_total)` no demuestra todavia que cada `tax_total` fue fiscalmente derivado correctamente desde `tax_snapshot`.
-
-Si `received_qty_base = 0`, `subtotal = 0` y `total` queda determinado por `subtotal + tax_total`. No asumir `tax_total` positivo como valido sin politica fiscal. El caso `received_qty_base = 0` con `tax_total > 0` queda dentro de la validacion fiscal pendiente; no inventar comportamiento hasta cerrar `tax_snapshot`.
+La consistencia agregada `purchases.tax_total = SUM(purchase_items.tax_total)` no sustituye la validacion fiscal por linea. Cada `purchase_items.tax_total` debe haberse validado antes contra `purchase_items.tax_snapshot` v1.
 
 `PURCHASE_TOTALS_INVALID` aplica a inconsistencias matematicas ya cerrables:
 
@@ -659,7 +762,7 @@ Si `received_qty_base = 0`, `subtotal = 0` y `total` queda determinado por `subt
 - header total no coincide con `header subtotal + header tax_total`;
 - purchase sin lineas con header no cero.
 
-No afirmar todavia que `PURCHASE_TOTALS_INVALID` cubre toda posible incoherencia interna de `tax_snapshot`.
+`PURCHASE_TOTALS_INVALID` no cubre incoherencia interna de `tax_snapshot`; esa clase de error corresponde a `PURCHASE_TAX_INVALID`.
 
 ### Snapshots descriptivos y no reescritura
 
@@ -681,7 +784,7 @@ Debe hacer rollback y devolver error deterministico. El usuario/flujo de edicion
 
 ## 20. Catalogo de errores cerrado hasta este micro-hito
 
-Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto solo en lo que dependa de la decision fiscal pendiente de `tax_snapshot`, inventario, costo promedio y replenishment.
+Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto solo en lo que dependa de inventario, costo promedio y replenishment.
 
 Idempotencia:
 
@@ -721,6 +824,7 @@ Validacion del `DRAFT`:
 
 - `PURCHASE_QUANTITY_INVALID`;
 - `PURCHASE_DIFFERENCE_REASON_REQUIRED`;
+- `PURCHASE_TAX_INVALID`;
 - `PURCHASE_TOTALS_INVALID`.
 
 No se crean errores de:
@@ -730,7 +834,6 @@ No se crean errores de:
 - `SUPPLIER_INACTIVE`;
 - `PRODUCT_INACTIVE`;
 - `PRODUCT_UNIT_INVALID`;
-- `PURCHASE_TAX_INVALID`;
 - inventario;
 - costo promedio;
 - replenishment.
@@ -774,13 +877,15 @@ No usar `PURCHASE_DRAFT_STALE` cuando el contenido persistido coincide con el fi
 
 `PURCHASE_DIFFERENCE_REASON_REQUIRED` ocurre cuando falta motivo no vacio en una linea no pedida, cuando existe al menos una linea asociada a un `purchase_order_item`, el recibido agregado difiere de `ordered_qty_base` y ninguna linea asociada contiene motivo valido, o cuando una linea explicita con recibido cero documenta faltante sin motivo. No aplica por la sola ausencia de `purchase_items` asociadas a un `purchase_order_item`.
 
-`PURCHASE_TOTALS_INVALID` ocurre cuando falla una relacion matematica ya cerrada: subtotal de linea, total de linea, sumas de header, `header total = header subtotal + header tax_total`, o compra sin lineas con importes de cabecera no cero. No cubre todavia toda posible incoherencia fiscal interna de `tax_snapshot`.
+`PURCHASE_TAX_INVALID` ocurre cuando el snapshot fiscal persistido es invalido o el calculo fiscal de linea es inconsistente con `docs/domain/tax-snapshot-v1.md`. Incluye como minimo: `tax_snapshot` no es objeto compatible, `{}`, keys faltantes, keys extra, `schema_version != 1`, `source_tax_profile_id` con tipo/rango invalido, `tax_object` con tipo invalido o blank, `treatment` invalido, `calculation_basis != EXCLUSIVE`, `components` no array, estructura de componente invalida, componente con key faltante/extra, `tax_code` blank o con whitespace extremo, `factor_type != RATE`, `rate` fuera de rango, combinacion `treatment/rate` invalida, componente duplicado, `base != subtotal`, `amount != ROUND(subtotal * rate, 2)`, `tax_total != SUM(component.amount)`, `tax_total` distinto de `0` cuando el treatment exige `0`, o cantidad/subtotal cero produciendo impuesto distinto de `0`.
+
+`PURCHASE_TOTALS_INVALID` ocurre cuando falla una relacion matematica ya cerrada fuera de la semantica interna del snapshot fiscal: subtotal de linea, total de linea, sumas de header, `header total = header subtotal + header tax_total`, o compra sin lineas con importes de cabecera no cero. No se usa para incoherencia interna de `tax_snapshot`.
 
 Los errores de idempotencia se resuelven por contrato de la key. No deben mezclarse mecanicamente con errores operativos de FASE B.
 
 No se crea `PURCHASE_BRANCH_MISMATCH` porque `branch_id` no es entrada independiente del comando.
 
-No se crean `SUPPLIER_INACTIVE`, `PRODUCT_INACTIVE`, `PRODUCT_UNIT_INVALID` ni `PURCHASE_TAX_INVALID`.
+No se crean `SUPPLIER_INACTIVE`, `PRODUCT_INACTIVE` ni `PRODUCT_UNIT_INVALID`.
 
 ## 22. Estados purchases
 
@@ -1039,15 +1144,16 @@ Queda congelado el prefijo y el bloque de validaciones del `DRAFT` antes de cual
 22. Validar `difference_reason` para lineas no pedidas, diferencias agregadas contra pedido cuando existen lineas asociadas y lineas explicitas con recibido cero.
 23. Validar `actual_unit_cost_base` como costo real persistido no negativo, sin sustituirlo por pedido, catalogo, proveedor ni costo promedio.
 24. Validar subtotal de linea con `ROUND(received_qty_base * actual_unit_cost_base, 2)`.
-25. Validar relaciones de total de linea: `purchase_items.total = purchase_items.subtotal + purchase_items.tax_total`.
-26. Validar sumas/totales de header: subtotal, `tax_total`, total por suma de lineas y `total = subtotal + tax_total`; si no hay lineas, todos deben ser cero.
-27. Dejar validacion semantica completa de `tax_snapshot` y derivacion fiscal exacta de `tax_total` como pendiente puntual.
-28. Ejecutar posteriormente effects/locks de inventario/reposicion todavia pendientes.
-29. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
+25. Validar `tax_snapshot` v1 segun `docs/domain/tax-snapshot-v1.md`.
+26. Validar `tax_total` contra `tax_snapshot` v1.
+27. Validar relaciones de total de linea: `purchase_items.total = purchase_items.subtotal + purchase_items.tax_total`.
+28. Validar sumas/totales de header: subtotal, `tax_total`, total por suma de lineas y `total = subtotal + tax_total`; si no hay lineas, todos deben ser cero.
+29. Ejecutar posteriormente effects/locks de inventario/reposicion todavia pendientes.
+30. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
 
 No se introducen todavia locks de inventario/reposicion. No se producen efectos antes de completar todas las validaciones cerradas del `DRAFT`.
 
-La consistencia supplier/product business puede validarse antes del fingerprint porque protege tenant/integridad. La semantica fiscal completa de `tax_snapshot` no se inventa en este micro-hito.
+La consistencia supplier/product business puede validarse antes del fingerprint porque protege tenant/integridad. La semantica fiscal completa de `tax_snapshot` v1 queda definida por `docs/domain/tax-snapshot-v1.md` y se valida antes de efectos.
 
 ## 35. Reconciliacion historica
 
@@ -1129,14 +1235,14 @@ Errores deterministicos de este micro-hito que pueden llegar a FASE C:
 - `PRODUCT_BUSINESS_MISMATCH`;
 - `PURCHASE_QUANTITY_INVALID`;
 - `PURCHASE_DIFFERENCE_REASON_REQUIRED`;
-- `PURCHASE_TOTALS_INVALID`.
+- `PURCHASE_TOTALS_INVALID`;
+- `PURCHASE_TAX_INVALID`.
 
 No se agregan a FASE C en este micro-hito:
 
 - `SUPPLIER_INACTIVE`;
 - `PRODUCT_INACTIVE`;
-- `PRODUCT_UNIT_INVALID`;
-- `PURCHASE_TAX_INVALID`.
+- `PRODUCT_UNIT_INVALID`.
 
 `PURCHASE_IDEMPOTENCY_KEY_REUSED` y `PURCHASE_IDEMPOTENCY_IN_PROGRESS` pertenecen al contrato de la key y no son errores operativos de FASE B.
 
@@ -1227,9 +1333,6 @@ El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no
 
 Antes de congelar `CONFIRM_PURCHASE v0.1`, faltan:
 
-- contrato exacto de `tax_snapshot` de compras;
-- derivacion/revalidacion fiscal exacta de `tax_total` desde `tax_snapshot`;
-- catalogo final de errores solo en lo que dependa de esa decision fiscal;
 - fulfillment/release;
 - inventory effects;
 - costo promedio;
