@@ -38,18 +38,24 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 - idempotencia;
 - permiso definitivo;
 - autorizacion completa;
+- politica historica de supplier/product/unit;
+- autoridad de cantidades;
+- consistencia `received_qty` -> `received_qty_base`;
+- `difference_reason`;
+- costo real de linea;
+- subtotal de linea;
+- total de linea;
+- sumatorias de cabecera;
+- errores de validacion del `DRAFT` cerrados hasta este micro-hito;
 - estados base;
 - recuperacion historica;
 - estructura FASE A / FASE B / FASE C hasta el punto seguro definido.
 
 Este borrador todavia deja abiertos:
 
-- catalogo final de errores;
-- supplier inactive;
-- product inactive;
-- unidad operativa;
-- `difference_reason`;
-- totales/impuestos;
+- contrato exacto de `tax_snapshot` de compras;
+- derivacion/revalidacion fiscal exacta de `tax_total` desde `tax_snapshot`;
+- catalogo final de errores solo en lo que dependa de esa decision fiscal;
 - inventory effects;
 - costo promedio;
 - replenishment fulfillment/release detallado;
@@ -269,7 +275,7 @@ Las lineas persistidas son la autoridad.
 
 `CONFIRM_PURCHASE` no reconstruye el `DRAFT` desde lineas reenviadas por el cliente.
 
-No existe error `PURCHASE_EMPTY` en este contrato. El negocio puede confirmar una recepcion donde nada llego. Puede existir una compra sin lineas recibidas persistidas o con lineas `received_qty = 0`, segun se cierre posteriormente la persistencia del DRAFT. `CONFIRM_PURCHASE` todavia debe poder cerrar el pedido y liberar todas las reservas si fisicamente no llego mercancia.
+No existe error `PURCHASE_EMPTY` en este contrato. El negocio puede confirmar una recepcion donde nada llego. Puede existir una compra sin lineas recibidas persistidas o con lineas `received_qty = 0`, segun se cierre posteriormente la persistencia del DRAFT. `CONFIRM_PURCHASE` debe poder representar que fisicamente no llego mercancia; la resolucion de reservas corresponde al futuro bloque de fulfillment/release.
 
 ## 12. expected_purchase_fingerprint
 
@@ -478,15 +484,204 @@ Para una nueva ejecucion o `IN_PROGRESS` recuperable, la branch debe estar opera
 
 `BRANCH_BUSINESS_MISMATCH` se usa solo cuando la branch ya pudo resolverse de forma segura dentro del contexto visible pero existe inconsistencia entre `branches.business_id` y el `business_id` autenticado esperado. Para recursos de otro tenant que no deben revelarse, usar `PURCHASE_NOT_FOUND`.
 
-`suppliers.business_id` debe coincidir con el business de `purchases.branch_id`. Si existe inconsistencia visible y segura, devolver `SUPPLIER_BUSINESS_MISMATCH`. Este micro-hito no cierra `SUPPLIER_INACTIVE`.
+`suppliers.business_id` debe coincidir con el business de `purchases.branch_id`. Si existe inconsistencia visible y segura, devolver `SUPPLIER_BUSINESS_MISMATCH`.
 
-Para cada `purchase_item`, `products.business_id` debe coincidir con el business de `purchases.branch_id`. Si no, devolver `PRODUCT_BUSINESS_MISMATCH`. Este micro-hito no cierra `PRODUCT_INACTIVE`.
+`supplier inactive` no bloquea `CONFIRM_PURCHASE v0.1`. El `purchase_order` ya fue confirmado historicamente, la mercancia puede haber llegado fisicamente y desactivar al proveedor afecta operaciones futuras, no el registro correcto de un hecho fisico ya ocurrido. Por tanto no se agrega `SUPPLIER_INACTIVE` al catalogo de `CONFIRM_PURCHASE`.
 
-La FK fisica `purchase_items(product_unit_id, product_id) -> product_units(id, product_id)` protege que la unidad pertenezca al mismo producto. No se cierra todavia un error funcional definitivo por unidad inactive/operativa y no se agrega `PRODUCT_UNIT_INVALID` al catalogo cerrado.
+Para cada `purchase_item`, `products.business_id` debe coincidir con el business de `purchases.branch_id`. Si no, devolver `PRODUCT_BUSINESS_MISMATCH`.
+
+`product inactive` no bloquea `CONFIRM_PURCHASE v0.1`. Un producto desactivado no debe seleccionarse para nuevas operaciones donde aplique, pero puede seguir formando parte de una recepcion historica valida. Si llego fisicamente, debe poder registrarse inventario. Por tanto no se agrega `PRODUCT_INACTIVE`.
+
+Una `product_unit` desactivada despues de preparar el `DRAFT` no bloquea la confirmacion historica. La recepcion usa `product_id` persistido, `product_unit_id` persistido y `factor_to_base_snapshot` persistido. No se sustituye el snapshot por `product_units.factor_to_base` actual y no se agrega `PRODUCT_UNIT_INVALID` por mera inactividad posterior.
+
+La FK fisica `purchase_items(product_unit_id, product_id) -> product_units(id, product_id)` protege que la unidad pertenezca al mismo producto. Si existe corrupcion que contradiga una FK fisicamente valida, tratarla como inconsistencia interna y no inventar un error funcional normal. `PRODUCT_UNIT_INVALID` no se usa como alias de unidad inactiva.
+
+## 19.2. Validacion del DRAFT antes de efectos
+
+`CONFIRM_PURCHASE` debe distinguir dos clases de rechazo antes de cualquier efecto de inventario o reposicion:
+
+- `DRAFT` stale: el contenido persistido cambio respecto de lo revisado por el usuario. `PURCHASE_DRAFT_STALE` aplica solo a este caso.
+- `DRAFT` invalido: el contenido persistido coincide con el fingerprint, pero viola una invariante funcional o matematica. Los errores nuevos de validacion aplican a este caso.
+
+Despues del fingerprint, `CONFIRM_PURCHASE` recalcula, revalida, compara y rechaza. No corrige silenciosamente el `DRAFT` para hacerlo valido.
+
+### Autoridad historica de cantidad
+
+`purchase_items.factor_to_base_snapshot` es la autoridad historica de conversion de la linea. No usar el factor actual del catalogo durante confirmacion. Debe cumplirse `factor_to_base_snapshot > 0` segun modelo fisico y la confirmacion no reescribe este factor.
+
+`received_qty` representa la cantidad capturada en la presentacion historica de la linea. Es dato persistido del `DRAFT` y debe ser `>= 0`.
+
+La cantidad base derivada canonica es:
+
+```text
+expected_received_qty_base = ROUND(received_qty * factor_to_base_snapshot, 4)
+```
+
+La aritmetica debe ser decimal exacta. Debe cumplirse:
+
+```text
+purchase_items.received_qty_base = expected_received_qty_base
+```
+
+`received_qty_base` no puede ser una segunda fuente independiente que contradiga `received_qty + factor_to_base_snapshot`. Si no coincide, devolver `PURCHASE_QUANTITY_INVALID`. No recalcular ni hacer `UPDATE` automatico.
+
+`PURCHASE_QUANTITY_INVALID` significa que el `DRAFT` persistido contiene una inconsistencia cuantitativa. Incluye como minimo:
+
+- `received_qty < 0` si llegara a existir estado corrupto;
+- `received_qty_base < 0`;
+- `factor_to_base_snapshot <= 0`;
+- `received_qty_base` distinto del resultado canonico de `received_qty * factor_to_base_snapshot`.
+
+No usar `PURCHASE_QUANTITY_INVALID` para diferencia contra lo pedido, stale, totales ni `difference_reason`.
+
+### Relacion con el pedido
+
+db-3 permite que varias `purchase_items` apunten al mismo `purchase_order_item_id`. Por tanto la comparacion contra lo pedido debe ser agregada y no se debe asumir relacion 1:1.
+
+La evaluacion debe partir del conjunto completo de `purchase_order_items` del pedido origen, no solamente de las `purchase_items` existentes. Para cada `purchase_order_item`:
+
+```text
+total_received_base =
+  COALESCE(
+    SUM(purchase_items.received_qty_base asociadas a ese purchase_order_item_id),
+    0
+  )
+
+ordered_base = purchase_order_items.ordered_qty_base
+```
+
+Si no existe ninguna `purchase_item` asociada a un `purchase_order_item`, el recibido agregado es `0`. Ese `purchase_order_item` no se omite del futuro procesamiento de `CONFIRM_PURCHASE`: se considera `received_base = 0` y posteriormente sus reservations deberan resolverse segun las reglas de fulfillment/release que todavia se disenaran.
+
+Si `total_received_base = ordered_base`, no existe diferencia cuantitativa agregada. Si `total_received_base < ordered_base`, existe faltante. Si `total_received_base > ordered_base`, existe excedente respecto de lo pedido. Esto no modifica Politica A de reposicion.
+
+Si `purchase_order_item_id IS NOT NULL`, `product_id` debe corresponder al producto de esa linea del pedido. db-3 lo protege mediante FK compuesta. Un producto equivocado no se representa apuntando la nueva mercancia al `order_item` original; debe representarse como linea original con recibido cero o faltante y nueva `purchase_item` con `purchase_order_item_id = NULL`.
+
+No es obligatorio que `purchase_item.product_unit_id = purchase_order_item.product_unit_id`. Puede recibirse el mismo producto en una presentacion distinta. Lo obligatorio es mismo `product_id`, `product_unit` perteneciente al producto, `factor_to_base_snapshot` valido y `received_qty_base` coherente. No modificar el pedido historico.
+
+### difference_reason
+
+Si existe al menos una `purchase_item` asociada a un `purchase_order_item` y el recibido agregado difiere de `purchase_order_items.ordered_qty_base`, debe existir al menos un `difference_reason` no vacio entre las `purchase_items` asociadas a ese `purchase_order_item`. No se exige repetir el mismo motivo en todas las lineas fraccionadas.
+
+Si un `purchase_order_item` tiene cero `purchase_items` asociadas, entonces `total_received_base = 0`. Aunque `ordered_qty_base > 0`, no se exige `PURCHASE_DIFFERENCE_REASON_REQUIRED` porque no existe una linea de compra donde persistir ese campo. La ausencia de `purchase_items` representa que no se recibio cantidad de esa linea. No crear una `purchase_item` artificial solo para almacenar un motivo ni crear automaticamente una linea con `received_qty = 0`.
+
+Si una linea con `received_qty_base = 0` se conserva explicitamente para documentar un faltante de esa linea, esa linea debe tener `difference_reason`.
+
+Para toda `purchase_item` con `purchase_order_item_id IS NULL`, `difference_reason` es obligatorio y no vacio porque representa mercancia aceptada que no estaba en el pedido historico. No necesita crear un `purchase_order_item` retrospectivo.
+
+`NULL`, texto vacio o texto con solo espacios se considera `difference_reason` ausente.
+
+`PURCHASE_DIFFERENCE_REASON_REQUIRED` aplica cuando:
+
+- `purchase_order_item_id IS NULL` y `difference_reason` esta ausente;
+- existe al menos una `purchase_item` asociada a un `purchase_order_item`, el recibido agregado difiere de `ordered_qty_base` y ninguna de sus lineas asociadas contiene un `difference_reason` valido;
+- existe explicitamente una `purchase_item` asociada con `received_qty_base = 0` para documentar faltante y esa linea no tiene reason.
+
+No aplica simplemente porque `ordered_qty_base > 0` y no existen `purchase_items` asociadas.
+
+### Compra sin lineas
+
+Una `purchase` puede confirmarse sin `purchase_items`. No existe `PURCHASE_EMPTY`.
+
+En ese caso:
+
+- todas las `purchase_order_items` del pedido tienen `total_received_base = 0`;
+- todas las cantidades reservadas aplicables podran liberarse en el futuro flujo de fulfillment/release;
+- no existe `difference_reason` obligatorio;
+
+Y los totales de cabecera deben ser:
+
+```text
+purchase.subtotal = 0
+purchase.tax_total = 0
+purchase.total = 0
+```
+
+### Costo real y subtotales
+
+`purchase_items.actual_unit_cost_base` es el costo real aceptado de la recepcion en unidad base. No sustituir por `expected_unit_cost_base` del pedido, `product_suppliers.cost_reference`, costo de catalogo vigente, costo promedio actual ni ningun costo recalculado arbitrariamente. Debe ser `>= 0` segun modelo fisico.
+
+`actual_unit_cost_base = 0` es valido en v0.1. Puede representar bonificacion, muestra, reposicion gratuita u otro caso real autorizado. No crear error por costo cero ni inventar una politica comercial adicional.
+
+Si `received_qty_base = 0`, `actual_unit_cost_base` puede conservar el valor historico capturado, pero no genera valor de entrada y el subtotal debe ser `0`. No exigir costo `0`.
+
+El subtotal canonico de linea es:
+
+```text
+expected_subtotal = ROUND(received_qty_base * actual_unit_cost_base, 2)
+```
+
+Debe cumplirse `purchase_items.subtotal = expected_subtotal`. Si no coincide, devolver `PURCHASE_TOTALS_INVALID`. No corregir automaticamente.
+
+### tax_snapshot y tax_total
+
+`purchase_items.tax_snapshot` es snapshot historico persistido del `DRAFT`. `CONFIRM_PURCHASE` no debe reemplazarlo porque cambio `tax_profile`, catalogo fiscal o configuracion posterior. No consultar catalogo vigente para reescribir la compra historica.
+
+Este micro-hito no declara una formula completa para derivar `tax_total` desde `tax_snapshot`. La estructura contractual exacta de `tax_snapshot` de compras y las reglas para uno o multiples impuestos todavia no estan definidas con suficiente precision.
+
+Por tanto este micro-hito no afirma nombres de keys JSON, tasa exacta, base exacta, lista de impuestos, formula de IVA, retenciones, redondeo por impuesto ni que `{}` implique necesariamente una semantica fiscal concreta salvo que una fuente autoritativa lo defina explicitamente.
+
+Hasta cerrar `tax_snapshot`, `purchase_items.tax_total` sigue siendo valor persistido del `DRAFT` incluido en fingerprint. Debe ser `>= 0` por modelo fisico. `CONFIRM_PURCHASE` todavia no puede certificar completamente que `tax_total` fue derivado correctamente desde `tax_snapshot`, pero si puede validar relaciones aritmeticas que no dependan de conocer la estructura interna del snapshot.
+
+No se crea `PURCHASE_TAX_INVALID` en este micro-hito. La razon no es que el impuesto nunca necesite error independiente, sino que el contrato de `tax_snapshot` todavia no esta suficientemente definido para establecer una semantica publica estable.
+
+### Totales de linea y cabecera
+
+Debe cumplirse:
+
+```text
+purchase_items.total = purchase_items.subtotal + purchase_items.tax_total
+```
+
+con precision monetaria correspondiente. Si no coincide, devolver `PURCHASE_TOTALS_INVALID`. Esta validacion no requiere interpretar `tax_snapshot`.
+
+Debe cumplirse:
+
+```text
+purchases.subtotal = SUM(purchase_items.subtotal)
+purchases.tax_total = SUM(purchase_items.tax_total)
+purchases.total = SUM(purchase_items.total)
+purchases.total = purchases.subtotal + purchases.tax_total
+```
+
+Si no hay lineas, la suma conceptual es `0` para subtotal, impuesto y total. Si no coincide, devolver `PURCHASE_TOTALS_INVALID`.
+
+La consistencia agregada `purchases.tax_total = SUM(purchase_items.tax_total)` no demuestra todavia que cada `tax_total` fue fiscalmente derivado correctamente desde `tax_snapshot`.
+
+Si `received_qty_base = 0`, `subtotal = 0` y `total` queda determinado por `subtotal + tax_total`. No asumir `tax_total` positivo como valido sin politica fiscal. El caso `received_qty_base = 0` con `tax_total > 0` queda dentro de la validacion fiscal pendiente; no inventar comportamiento hasta cerrar `tax_snapshot`.
+
+`PURCHASE_TOTALS_INVALID` aplica a inconsistencias matematicas ya cerrables:
+
+- subtotal de linea no coincide con `received_qty_base * actual_unit_cost_base` redondeado a 2;
+- line total no coincide con `subtotal + tax_total`;
+- header subtotal no coincide con suma de subtotales de linea;
+- header `tax_total` no coincide con suma de `tax_total` de linea;
+- header total no coincide con suma de totales de linea;
+- header total no coincide con `header subtotal + header tax_total`;
+- purchase sin lineas con header no cero.
+
+No afirmar todavia que `PURCHASE_TOTALS_INVALID` cubre toda posible incoherencia interna de `tax_snapshot`.
+
+### Snapshots descriptivos y no reescritura
+
+Los snapshots descriptivos de SKU, descripcion, nombre/codigo de unidad y claves SAT descriptivas son historia/display del `DRAFT`. No reconsultarlos para sobrescribirlos durante `CONFIRM_PURCHASE` y no ampliar fingerprint en este micro-hito.
+
+Si cualquier validacion falla, `CONFIRM_PURCHASE` no modifica para corregir:
+
+- `received_qty`;
+- `received_qty_base`;
+- `factor_to_base_snapshot`;
+- `actual_unit_cost_base`;
+- `tax_snapshot`;
+- `subtotal`;
+- `tax_total`;
+- `total`;
+- `difference_reason`.
+
+Debe hacer rollback y devolver error deterministico. El usuario/flujo de edicion debe corregir el `DRAFT` y volver a confirmar con nuevo fingerprint y nueva `idempotency_key`.
 
 ## 20. Catalogo de errores cerrado hasta este micro-hito
 
-Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto porque faltan decisiones sobre supplier inactive, product inactive, unidad operativa, `difference_reason`, totales/impuestos, inventario, costo y replenishment.
+Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto solo en lo que dependa de la decision fiscal pendiente de `tax_snapshot`, inventario, costo promedio y replenishment.
 
 Idempotencia:
 
@@ -522,17 +717,22 @@ Product / business:
 
 - `PRODUCT_BUSINESS_MISMATCH`.
 
-No se crean todavia errores de:
+Validacion del `DRAFT`:
+
+- `PURCHASE_QUANTITY_INVALID`;
+- `PURCHASE_DIFFERENCE_REASON_REQUIRED`;
+- `PURCHASE_TOTALS_INVALID`.
+
+No se crean errores de:
 
 - `PURCHASE_BRANCH_MISMATCH`;
 - `PURCHASE_BUSINESS_MISMATCH`;
 - `SUPPLIER_INACTIVE`;
 - `PRODUCT_INACTIVE`;
 - `PRODUCT_UNIT_INVALID`;
-- `difference_reason`;
-- totales;
+- `PURCHASE_TAX_INVALID`;
 - inventario;
-- costo;
+- costo promedio;
 - replenishment.
 
 No se crea `PURCHASE_EMPTY` ni equivalente.
@@ -547,10 +747,12 @@ No se crea `PURCHASE_EMPTY` ni equivalente.
 
 `PURCHASE_STATUS_INVALID` ocurre cuando la `purchase` existe pero su estado no es confirmable y no corresponde a reconciliacion historica segura. Ejemplo directo: `CANCELLED`.
 
-`PURCHASE_DRAFT_STALE` ocurre ante cualquier cambio semantico respecto del `DRAFT` esperado, incluyendo:
+`PURCHASE_DRAFT_STALE` ocurre ante cambio semantico respecto del `DRAFT` esperado, incluyendo:
 
 - fingerprint diferente;
 - identidad/herencia distinta entre pre-read y locks.
+
+No usar `PURCHASE_DRAFT_STALE` cuando el contenido persistido coincide con el fingerprint pero viola una invariante funcional o matematica. En ese caso corresponde el error deterministico especifico de validacion del `DRAFT`.
 
 `PURCHASE_ORDER_STATUS_INVALID` ocurre cuando la `purchase` esta `DRAFT` pero el `purchase_order` relacionado no esta en `CONFIRMED`, que es el estado requerido para ejecutar una nueva confirmacion.
 
@@ -568,11 +770,17 @@ No se crea `PURCHASE_EMPTY` ni equivalente.
 
 `PRODUCT_BUSINESS_MISMATCH` ocurre cuando al menos una `purchase_item` referencia un producto cuyo business no coincide con el business de la branch de la `purchase`. Es inconsistencia multiempresa y no debe confundirse con product inactive.
 
+`PURCHASE_QUANTITY_INVALID` ocurre cuando el `DRAFT` persistido contiene una inconsistencia cuantitativa: cantidades negativas si aparecieran por corrupcion, `factor_to_base_snapshot <= 0` o `received_qty_base` distinto del resultado canonico `ROUND(received_qty * factor_to_base_snapshot, 4)`.
+
+`PURCHASE_DIFFERENCE_REASON_REQUIRED` ocurre cuando falta motivo no vacio en una linea no pedida, cuando existe al menos una linea asociada a un `purchase_order_item`, el recibido agregado difiere de `ordered_qty_base` y ninguna linea asociada contiene motivo valido, o cuando una linea explicita con recibido cero documenta faltante sin motivo. No aplica por la sola ausencia de `purchase_items` asociadas a un `purchase_order_item`.
+
+`PURCHASE_TOTALS_INVALID` ocurre cuando falla una relacion matematica ya cerrada: subtotal de linea, total de linea, sumas de header, `header total = header subtotal + header tax_total`, o compra sin lineas con importes de cabecera no cero. No cubre todavia toda posible incoherencia fiscal interna de `tax_snapshot`.
+
 Los errores de idempotencia se resuelven por contrato de la key. No deben mezclarse mecanicamente con errores operativos de FASE B.
 
 No se crea `PURCHASE_BRANCH_MISMATCH` porque `branch_id` no es entrada independiente del comando.
 
-No se crean todavia `SUPPLIER_INACTIVE`, `PRODUCT_INACTIVE` ni `PRODUCT_UNIT_INVALID`.
+No se crean `SUPPLIER_INACTIVE`, `PRODUCT_INACTIVE`, `PRODUCT_UNIT_INVALID` ni `PURCHASE_TAX_INVALID`.
 
 ## 22. Estados purchases
 
@@ -805,7 +1013,7 @@ FASE A no produce efectos de negocio:
 
 FASE B aun no esta completa en este borrador.
 
-Por ahora queda congelado solamente este prefijo:
+Queda congelado el prefijo y el bloque de validaciones del `DRAFT` antes de cualquier efecto:
 
 1. Bloquear/verificar `idempotency_key` reservada.
 2. Obtener metadata preleida necesaria del `purchase`.
@@ -824,13 +1032,22 @@ Por ahora queda congelado solamente este prefijo:
 15. Validar `PRODUCT_BUSINESS_MISMATCH` si alguna linea referencia producto de otro business.
 16. Recalcular purchase fingerprint autoritativo.
 17. Comparar contra `expected_purchase_fingerprint`.
-18. Ejecutar posteriormente las validaciones de dominio todavia pendientes.
-19. Ejecutar posteriormente effects/locks de inventario/reposicion todavia pendientes.
-20. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
+18. Aplicar politica historica de supplier/product/unit: inactividad posterior no bloquea recepcion; multiempresa si bloquea.
+19. Validar relacion producto/order-item: si hay `purchase_order_item_id`, el producto debe corresponder a esa linea; productos equivocados se representan con linea original faltante y linea no pedida.
+20. Validar consistencia quantity/factor: `received_qty`, `factor_to_base_snapshot` y `received_qty_base` coherentes segun `ROUND(received_qty * factor_to_base_snapshot, 4)`.
+21. Para cada `purchase_order_item` del pedido origen, obtener todas sus `purchase_items` asociadas, calcular `total_received_base = COALESCE(SUM(received_qty_base), 0)` y comparar contra `purchase_order_items.ordered_qty_base` sin asumir 1:1 ni omitir order items sin linea recibida.
+22. Validar `difference_reason` para lineas no pedidas, diferencias agregadas contra pedido cuando existen lineas asociadas y lineas explicitas con recibido cero.
+23. Validar `actual_unit_cost_base` como costo real persistido no negativo, sin sustituirlo por pedido, catalogo, proveedor ni costo promedio.
+24. Validar subtotal de linea con `ROUND(received_qty_base * actual_unit_cost_base, 2)`.
+25. Validar relaciones de total de linea: `purchase_items.total = purchase_items.subtotal + purchase_items.tax_total`.
+26. Validar sumas/totales de header: subtotal, `tax_total`, total por suma de lineas y `total = subtotal + tax_total`; si no hay lineas, todos deben ser cero.
+27. Dejar validacion semantica completa de `tax_snapshot` y derivacion fiscal exacta de `tax_total` como pendiente puntual.
+28. Ejecutar posteriormente effects/locks de inventario/reposicion todavia pendientes.
+29. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
 
-No se introducen todavia locks de inventario/reposicion. No se define todavia supplier active, product active, unidad operativa, `difference_reason` ni totales/impuestos.
+No se introducen todavia locks de inventario/reposicion. No se producen efectos antes de completar todas las validaciones cerradas del `DRAFT`.
 
-La consistencia supplier/product business puede validarse antes del fingerprint porque protege tenant/integridad. Las politicas funcionales abiertas no se inventan en este prefijo.
+La consistencia supplier/product business puede validarse antes del fingerprint porque protege tenant/integridad. La semantica fiscal completa de `tax_snapshot` no se inventa en este micro-hito.
 
 ## 35. Reconciliacion historica
 
@@ -909,7 +1126,17 @@ Errores deterministicos de este micro-hito que pueden llegar a FASE C:
 - `BRANCH_INACTIVE`;
 - `BRANCH_BUSINESS_MISMATCH`;
 - `SUPPLIER_BUSINESS_MISMATCH`;
-- `PRODUCT_BUSINESS_MISMATCH`.
+- `PRODUCT_BUSINESS_MISMATCH`;
+- `PURCHASE_QUANTITY_INVALID`;
+- `PURCHASE_DIFFERENCE_REASON_REQUIRED`;
+- `PURCHASE_TOTALS_INVALID`.
+
+No se agregan a FASE C en este micro-hito:
+
+- `SUPPLIER_INACTIVE`;
+- `PRODUCT_INACTIVE`;
+- `PRODUCT_UNIT_INVALID`;
+- `PURCHASE_TAX_INVALID`.
 
 `PURCHASE_IDEMPOTENCY_KEY_REUSED` y `PURCHASE_IDEMPOTENCY_IN_PROGRESS` pertenecen al contrato de la key y no son errores operativos de FASE B.
 
@@ -992,16 +1219,17 @@ Este micro-hito no requiere:
 - indice obligatorio;
 - db-4.
 
+No agregar `CHECKs` solo porque estas reglas se validen en servicio.
+
 El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no evolucion fisica del modelo.
 
 ## 43. Puntos pendientes antes del freeze
 
 Antes de congelar `CONFIRM_PURCHASE v0.1`, faltan:
 
-- catalogo completo de errores;
-- reglas de productos/unidades;
-- `difference_reason`;
-- autoridad/revalidacion de totales;
+- contrato exacto de `tax_snapshot` de compras;
+- derivacion/revalidacion fiscal exacta de `tax_total` desde `tax_snapshot`;
+- catalogo final de errores solo en lo que dependa de esa decision fiscal;
 - fulfillment/release;
 - inventory effects;
 - costo promedio;
@@ -1021,6 +1249,15 @@ No quedan como pendientes en este borrador:
 - frontera tenant;
 - acceso de sucursal;
 - errores business cerrados en este micro-hito;
+- supplier inactive;
+- product inactive;
+- unidad operativa/inactiva posterior;
+- autoridad de cantidades;
+- `difference_reason`;
+- autoridad de costo real;
+- subtotal de linea;
+- total de linea;
+- sumatorias de cabecera;
 - folio de confirmacion;
 - parent mutex;
 - inmutabilidad purchase/order;
