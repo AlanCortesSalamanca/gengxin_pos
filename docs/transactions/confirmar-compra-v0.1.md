@@ -2221,7 +2221,7 @@ purchase.total = 0
 
 ### Costo real y subtotales
 
-`purchase_items.actual_unit_cost_base` es el costo real aceptado de la recepcion en unidad base. Para `CONFIRM_PURCHASE v0.1`, significa costo unitario neto antes de impuestos. No sustituir por `expected_unit_cost_base` del pedido, `product_suppliers.cost_reference`, costo de catalogo vigente, costo promedio actual ni ningun costo recalculado arbitrariamente. Debe ser `>= 0` segun modelo fisico.
+`purchase_items.actual_unit_cost_base` es el costo real aceptado de la recepcion en unidad base. Para `CONFIRM_PURCHASE v0.1`, significa costo unitario neto antes de impuestos. No sustituir por `expected_unit_cost_base` del pedido, `product_suppliers.unit_cost_reference`, costo de catalogo vigente, costo promedio actual ni ningun costo recalculado arbitrariamente. Debe ser `>= 0` segun modelo fisico.
 
 `actual_unit_cost_base = 0` es valido en v0.1. Puede representar bonificacion, muestra, reposicion gratuita u otro caso real autorizado. No crear error por costo cero ni inventar una politica comercial adicional.
 
