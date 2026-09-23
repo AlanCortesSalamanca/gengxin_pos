@@ -968,11 +968,11 @@ CREATE TABLE replenishment_allocation_fulfillments (
   purchase_order_item_id BIGINT NOT NULL,
   fulfilled_qty_base NUMERIC(18,4) NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT uq_replenishment_allocation_fulfillments_allocation_purchase_item UNIQUE (replenishment_allocation_id, purchase_item_id),
+  CONSTRAINT uq_replenishment_allocation_fulfillments_alloc_purchase_item UNIQUE (replenishment_allocation_id, purchase_item_id),
   CONSTRAINT fk_replenishment_allocation_fulfillments_allocation FOREIGN KEY (replenishment_allocation_id) REFERENCES replenishment_allocations(id),
   CONSTRAINT fk_replenishment_allocation_fulfillments_purchase_item FOREIGN KEY (purchase_item_id) REFERENCES purchase_items(id),
   CONSTRAINT fk_replenishment_allocation_fulfillments_allocation_order_item FOREIGN KEY (replenishment_allocation_id, purchase_order_item_id) REFERENCES replenishment_allocations(id, purchase_order_item_id),
-  CONSTRAINT fk_replenishment_allocation_fulfillments_purchase_item_order_item FOREIGN KEY (purchase_item_id, purchase_order_item_id) REFERENCES purchase_items(id, purchase_order_item_id),
+  CONSTRAINT fk_replenishment_allocation_fulfillments_purchase_item_order FOREIGN KEY (purchase_item_id, purchase_order_item_id) REFERENCES purchase_items(id, purchase_order_item_id),
   CONSTRAINT ck_replenishment_allocation_fulfillments_qty_positive CHECK (fulfilled_qty_base > 0)
 );
 
