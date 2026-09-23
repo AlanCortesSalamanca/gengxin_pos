@@ -53,6 +53,12 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 - sumatorias de cabecera;
 - replenishment fulfillment seguro sobre reservations preexistentes;
 - trazabilidad cuantitativa `purchase_item -> replenishment_allocation` mediante `replenishment_allocation_fulfillments`;
+- `planned_release_delta` definitivo;
+- terminalizacion de `replenishment_allocations` del pedido origen;
+- `PURCHASE_FULFILL` y `ORDER_RELEASE` definitivos;
+- deltas exactos de `replenishment_positions` para reposicion;
+- granularidad y referencia de `replenishment_movements` de compra;
+- reconciliacion allocation / movement / position para reposicion;
 - errores de validacion del `DRAFT` cerrados hasta este micro-hito;
 - estados base;
 - recuperacion historica;
@@ -62,9 +68,6 @@ Este borrador todavia deja abiertos:
 
 - inventory effects;
 - costo promedio;
-- `PURCHASE_FULFILL` completo fuera de la actualizacion agregada y detail db-4;
-- `ORDER_RELEASE` definitivo;
-- movements y positions de reposicion;
 - orden global final de locks;
 - isolation final;
 - audit payload;
@@ -633,7 +636,7 @@ No significa automaticamente:
 fulfilled_qty_base = received_applicable_to_replenishment_base
 ```
 
-El fulfillment agregado real se determina en este contrato con `safe_fulfill_now`, limitado por reservations preexistentes, demanda realmente pendiente, reglas por `sale_item` y devoluciones `RETURN_RESTOCK` posteriores al pedido. La regla definitiva de release sigue pendiente.
+El fulfillment agregado real se determina en este contrato con `safe_fulfill_now`, limitado por reservations preexistentes, demanda realmente pendiente, reglas por `sale_item` y devoluciones `RETURN_RESTOCK` posteriores al pedido. La regla definitiva de release se cierra mas adelante como `planned_release_delta = remaining_reserved - planned_fulfill_delta`.
 
 La regla no modifica retrospectivamente `purchase_order_items.replenishment_qty_base`, `customer_special_qty_base`, `stock_extra_qty_base` ni `ordered_qty_base`. Tampoco reclasifica `stock_extra` o `customer_special` como replenishment; ambos son motivos non-replenishment para este calculo.
 
@@ -990,7 +993,7 @@ new_allocation_fulfilled_qty_base =
   + planned_fulfill_delta
 ```
 
-Esta forma incremental sigue siendo correcta ante un estado defensivo parcialmente resuelto. La formula definitiva de `released_qty_base` queda pendiente para `ORDER_RELEASE`; este micro-hito no la congela.
+Esta forma incremental sigue siendo correcta ante un estado defensivo parcialmente resuelto. La formula definitiva de `released_qty_base` se cierra en este micro-hito con `planned_release_delta = remaining_reserved - planned_fulfill_delta` y se materializa junto con `ORDER_RELEASE`.
 
 La descomposicion cuantitativa autoritativa de ese `planned_fulfill_delta` se inserta en `replenishment_allocation_fulfillments`:
 
@@ -1102,7 +1105,7 @@ source_capacity_remaining =
   source_capacity_remaining - detail_delta
 ```
 
-Continuar hasta `allocation_remaining_to_source = 0`. Debe ser error interno de planificacion si no existen sources suficientes para explicar un `planned_fulfill_delta` previamente calculado. No crear nuevo error publico todavia.
+Continuar hasta `allocation_remaining_to_source = 0`. Si no existen sources suficientes para explicar un `planned_fulfill_delta` previamente calculado, corresponde `PURCHASE_REPLENISHMENT_INCONSISTENT`.
 
 Ejemplo many-to-many:
 
@@ -1127,7 +1130,7 @@ Durante la materializacion del plan, la operacion debe actualizar `replenishment
 
 Replay/recovery no debe reinsertar detail. Si una confirmacion historica ya quedo completa, se reconcilia idempotencia sin repetir fulfillment ni insertar rows nuevas. Si el estado historico es inconsistente, no hacer auto-repair ni backfill silencioso de `replenishment_allocation_fulfillments`.
 
-No crear `replenishment_allocation_fulfillments` para representar release, inventario, costo promedio, movements ni positions. Esos efectos siguen teniendo contratos pendientes o separados.
+No crear `replenishment_allocation_fulfillments` para representar release, inventario, costo promedio, movements ni positions. Release no tiene detail por `purchase_item`; los movements y positions de reposicion se materializan por las reglas cerradas abajo.
 
 El calculo de SAFE EARLY RESOLUTION y del detail db-4 requiere estado consistente de:
 
@@ -1138,6 +1141,256 @@ El calculo de SAFE EARLY RESOLUTION y del detail db-4 requiere estado consistent
 - purchase/order actual.
 
 Este micro-hito no fija todavia el orden global de locks.
+
+### PURCHASE_FULFILL, ORDER_RELEASE y positions de reposicion
+
+Despues de que toda la compra tenga plan SAFE y antes de materializar efectos, cada allocation relevante debe tener cerrado:
+
+```text
+remaining_reserved =
+  reserved_qty_base
+  - fulfilled_qty_base
+  - released_qty_base
+
+planned_fulfill_delta =
+  safe_fulfill_now
+
+planned_release_delta =
+  remaining_reserved
+  - planned_fulfill_delta
+```
+
+Debe cumplirse:
+
+```text
+planned_fulfill_delta >= 0
+planned_release_delta >= 0
+
+planned_fulfill_delta
++ planned_release_delta
+= remaining_reserved
+```
+
+Nunca usar `reserved_qty_base` completo como base del release si la allocation ya tiene fulfillment o release historico. La cantidad pendiente de resolver siempre es `remaining_reserved`.
+
+Despues de materializar exitosamente el plan:
+
+```text
+new_fulfilled_qty_base =
+  old_fulfilled_qty_base
+  + planned_fulfill_delta
+
+new_released_qty_base =
+  old_released_qty_base
+  + planned_release_delta
+```
+
+Debe cumplirse:
+
+```text
+new_fulfilled_qty_base
++ new_released_qty_base
+= reserved_qty_base
+```
+
+Por tanto toda `replenishment_allocations` del `purchase_order` origen queda terminal al confirmar la compra. Esto es coherente con que db-4 mantiene una sola `purchase` por `purchase_order`, no hay recepciones parciales sucesivas y el `purchase_order` termina `CLOSED`.
+
+Para cada allocation con `planned_fulfill_delta > 0`, crear exactamente un `replenishment_movements`:
+
+```text
+movement_type = 'PURCHASE_FULFILL'
+demand_delta_base = -planned_fulfill_delta
+committed_delta_base = -planned_fulfill_delta
+reference_entity_type = 'replenishment_allocations'
+reference_entity_id = replenishment_allocations.id
+actor_user_id = actor actual autorizado de CONFIRM_PURCHASE
+```
+
+No crear `PURCHASE_FULFILL` con cantidad cero. `PURCHASE_FULFILL` representa demanda realmente cubierta; reduce `demand_qty_base` y tambien resuelve la reservation comprometida.
+
+Para cada allocation con `planned_release_delta > 0`, crear exactamente un `replenishment_movements`:
+
+```text
+movement_type = 'ORDER_RELEASE'
+demand_delta_base = 0
+committed_delta_base = -planned_release_delta
+reference_entity_type = 'replenishment_allocations'
+reference_entity_id = replenishment_allocations.id
+actor_user_id = actor actual autorizado de CONFIRM_PURCHASE
+```
+
+No crear `ORDER_RELEASE` con cantidad cero. `ORDER_RELEASE` libera compromiso, no cubre demanda y por eso no reduce `demand_qty_base`.
+
+La granularidad del ledger queda cerrada como un movement por allocation y por tipo no-cero:
+
+- `F = 6`, `R = 4`: un `PURCHASE_FULFILL` por `6` y un `ORDER_RELEASE` por `4`.
+- `F = 10`, `R = 0`: solo `PURCHASE_FULFILL`.
+- `F = 0`, `R = 10`: solo `ORDER_RELEASE`.
+
+No agregar un movement agregado por `purchase_order_item` si eso elimina la trazabilidad por allocation.
+
+`ORDER_RESERVE` historico puede referenciar `purchase_order_items` sin contradiccion. Cada tipo de movement usa la entidad que mejor representa su efecto: `ORDER_RESERVE` representa la reserva creada por la linea del pedido, mientras `PURCHASE_FULFILL` y `ORDER_RELEASE` representan resolucion terminal de una allocation concreta.
+
+Conceptualmente, agrupar todas las allocations afectadas por:
+
+```text
+branch_id
+product_id
+channel
+```
+
+Para cada `replenishment_positions` afectada:
+
+```text
+total_fulfilled =
+  SUM(planned_fulfill_delta)
+
+total_released =
+  SUM(planned_release_delta)
+
+new_demand_qty_base =
+  old_demand_qty_base
+  - total_fulfilled
+
+new_committed_qty_base =
+  old_committed_qty_base
+  - total_fulfilled
+  - total_released
+```
+
+Debe cumplirse:
+
+```text
+new_demand_qty_base >= 0
+new_committed_qty_base >= 0
+```
+
+No usar `GREATEST(..., 0)` para ocultar inconsistencias. Si el calculo daria negativo, es inconsistencia de reposicion y debe fallar como `PURCHASE_REPLENISHMENT_INCONSISTENT`.
+
+`committed_qty_base > demand_qty_base` puede ser estado valido antes de resolver la compra. Ejemplo:
+
+```text
+venta = 10
+ORDER_RESERVE = 10
+RETURN_RESTOCK posterior reduce demand a 6
+
+posicion antes de compra:
+demand = 6
+committed = 10
+
+compra puede fulfill 6:
+F = 6
+R = 4
+
+resultado:
+new demand = 0
+new committed = 0
+```
+
+Movements:
+
+```text
+PURCHASE_FULFILL:
+  demand -6
+  committed -6
+
+ORDER_RELEASE:
+  demand 0
+  committed -4
+```
+
+No rechazar simplemente porque `committed_qty_base > demand_qty_base` antes de resolver. La validacion relevante es que los deltas planificados no produzcan negativos al aplicarse.
+
+No actualizar directamente `available_to_order_base`. En db-4 es columna generada:
+
+```text
+GREATEST(
+  demand_qty_base - committed_qty_base,
+  0
+)
+```
+
+PostgreSQL la recalcula automaticamente despues de actualizar `demand_qty_base` y `committed_qty_base`.
+
+Cada `replenishment_positions` realmente modificada por `CONFIRM_PURCHASE` debe incrementar:
+
+```text
+version = version + 1
+```
+
+exactamente una vez dentro de esta operacion por position agregada, aunque existan multiples allocations y movements para ella. No incrementar `version` por cada movement individual.
+
+db-4 tiene `touch_updated_at()` sobre `replenishment_allocations` y `replenishment_positions`. `CONFIRM_PURCHASE` no disena un `UPDATE` manual especial de `updated_at`; al actualizar `fulfilled_qty_base`, `released_qty_base`, `demand_qty_base`, `committed_qty_base` o `version`, el trigger normal mantiene `updated_at`. El detail `replenishment_allocation_fulfillments` no tiene `updated_at` porque es historico de creacion.
+
+`CONFIRM_PURCHASE` no debe inventar una `replenishment_positions` para una allocation existente. Una allocation valida implica que existe la position correspondiente para `branch_id`, `product_id` y `channel`. Si falta, no crearla silenciosamente durante `CONFIRM_PURCHASE`; tratarlo como `PURCHASE_REPLENISHMENT_INCONSISTENT`.
+
+Antes de aplicar efectos, validar que cada allocation relevante sea coherente con la position que afectara:
+
+```text
+allocation.branch_id = position.branch_id
+allocation.product_id = position.product_id
+allocation.channel = position.channel
+```
+
+No cruzar branch, product ni `CASH` / `TRANSFER`. No permitir compensacion entre channels.
+
+Codigo estable para inconsistencias de este bloque:
+
+```text
+PURCHASE_REPLENISHMENT_INCONSISTENT
+```
+
+Usarlo cuando el `DRAFT` y su fingerprint pueden ser correctos, pero el estado interno de reposicion no permite materializar el plan. Ejemplos:
+
+- position esperada inexistente;
+- branch/product/channel de allocation no coincide con la position;
+- committed insuficiente para resolver `planned_fulfill_delta + planned_release_delta`;
+- demand insuficiente para aplicar `planned_fulfill_delta`;
+- allocation no puede terminalizar segun `reserved_qty_base`, `fulfilled_qty_base` y `released_qty_base`;
+- `SUM(detail)`, movements o estado historico incompatible detectado durante camino normal;
+- source planning imposible despues de un plan SAFE;
+- cualquier reconciliacion interna de este bloque que implicaria negativos.
+
+No usar `PURCHASE_DRAFT_STALE`: el purchase `DRAFT` puede no haber cambiado.
+
+`PURCHASE_REPLENISHMENT_INCONSISTENT` es deterministico para el estado observado, hace rollback completo de FASE B, puede persistirse `FAILED` en FASE C y conserva el `error_code` original. No confundir con `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, que sigue siendo temporal/retryable y no termina `FAILED`.
+
+La position puede actualizarse agregada una sola vez por `branch/product/channel`, mientras el ledger conserva movements por allocation. Debe reconciliar:
+
+```text
+SUM(PURCHASE_FULFILL.demand_delta_base)
+= -total_fulfilled
+
+SUM(PURCHASE_FULFILL.committed_delta_base)
++ SUM(ORDER_RELEASE.committed_delta_base)
+= -(total_fulfilled + total_released)
+```
+
+Esos deltas deben corresponder exactamente al cambio de la `replenishment_positions` durante `CONFIRM_PURCHASE`.
+
+Dentro de la misma FASE B deben quedar juntos:
+
+- update `replenishment_allocations.fulfilled_qty_base`;
+- update `replenishment_allocations.released_qty_base`;
+- fulfillment detail db-4;
+- `PURCHASE_FULFILL`;
+- `ORDER_RELEASE`;
+- update `replenishment_positions`;
+- incremento de `version` por position.
+
+Si falla cualquiera, `ROLLBACK` completo de FASE B. Este micro-hito no cierra todavia inventario ni `COMMIT` final global.
+
+Replay `COMPLETED` o reconciliacion historica no recrea movements, no vuelve a modificar positions y no vuelve a terminalizar allocations. Solo reconoce efectos ya commiteados; no duplica `PURCHASE_FULFILL` ni `ORDER_RELEASE`. No se agrega nueva identidad fisica para estos efectos.
+
+Casos minimos cerrados:
+
+- Caso A: `remaining_reserved = 10`, `received_applicable = 10`, `F = 10`, `R = 0`; position `demand -10`, `committed -10`; movement `PURCHASE_FULFILL 10`.
+- Caso B: `remaining_reserved = 10`, `received_applicable = 6`, `F = 6`, `R = 4`; position `demand -6`, `committed -10`; movements `PURCHASE_FULFILL 6` y `ORDER_RELEASE 4`.
+- Caso C: `remaining_reserved = 10`, `received_applicable = 0`, `F = 0`, `R = 10`; position `demand 0`, `committed -10`; movement `ORDER_RELEASE 10`.
+- Caso D: `remaining_reserved = 10`, `received_applicable = 14`; `F maximo = 10`, `R = 0`; excedente fisico `4` no crea reposicion nueva y queda para inventario pendiente.
+- Caso E: allocations remaining `3 / 4 / 3`, `received_applicable = 6`; resultado `A F3 R0`, `B F3 R1`, `C F0 R3`; totales `F = 6`, `R = 4`; position `demand -6`, `committed -10`.
+
+Interaccion cerrada con `RETURN_RESTOCK`: si `reserved remaining = 10`, demanda actual restante por returns `= 6` y `received_applicable >= 10`, SAFE produce `F = 6` y `R = 4`. No fulfillar `10`; no reducir demand por release. Esto conserva la regla ya congelada de `CONFIRM_RETURN`: `RETURN_RESTOCK` reduce demanda pero no modifica compromiso, por lo que `committed > demand` puede ser temporalmente valido hasta resolver la compra.
 
 ### difference_reason
 
@@ -1349,7 +1602,7 @@ Debe hacer rollback y devolver error deterministico. El usuario/flujo de edicion
 
 ## 20. Catalogo de errores cerrado hasta este micro-hito
 
-Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto solo en lo que dependa de inventario, costo promedio y replenishment.
+Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto solo en lo que dependa de inventario y costo promedio.
 
 Idempotencia:
 
@@ -1392,6 +1645,11 @@ Validacion del `DRAFT`:
 - `PURCHASE_TAX_INVALID`;
 - `PURCHASE_TOTALS_INVALID`.
 
+Reposicion:
+
+- `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`;
+- `PURCHASE_REPLENISHMENT_INCONSISTENT`.
+
 No se crean errores de:
 
 - `PURCHASE_BRANCH_MISMATCH`;
@@ -1400,8 +1658,7 @@ No se crean errores de:
 - `PRODUCT_INACTIVE`;
 - `PRODUCT_UNIT_INVALID`;
 - inventario;
-- costo promedio;
-- replenishment.
+- costo promedio.
 
 No se crea `PURCHASE_EMPTY` ni equivalente.
 
@@ -1445,6 +1702,10 @@ No usar `PURCHASE_DRAFT_STALE` cuando el contenido persistido coincide con el fi
 `PURCHASE_TAX_INVALID` ocurre cuando el snapshot fiscal persistido es invalido o el calculo fiscal de linea es inconsistente con `docs/domain/tax-snapshot-v1.md`. Incluye como minimo: `tax_snapshot` no es objeto compatible, `{}`, keys faltantes, keys extra, `schema_version != 1`, `source_tax_profile_id` con tipo/rango invalido, `tax_object` con tipo invalido o blank, `treatment` invalido, `calculation_basis != EXCLUSIVE`, `components` no array, estructura de componente invalida, componente con key faltante/extra, `tax_code` blank o con whitespace extremo, `factor_type != RATE`, `rate` fuera de rango, combinacion `treatment/rate` invalida, componente duplicado, `base != subtotal`, `amount != ROUND(subtotal * rate, 2)`, `tax_total != SUM(component.amount)`, `tax_total` distinto de `0` cuando el treatment exige `0`, o cantidad/subtotal cero produciendo impuesto distinto de `0`.
 
 `PURCHASE_TOTALS_INVALID` ocurre cuando falla una relacion matematica ya cerrada fuera de la semantica interna del snapshot fiscal: subtotal de linea, total de linea, sumas de header, `header total = header subtotal + header tax_total`, o compra sin lineas con importes de cabecera no cero. No se usa para incoherencia interna de `tax_snapshot`.
+
+`PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` ocurre cuando una reservation historica anterior todavia activa puede cambiar cuanto fulfillment corresponde de forma definitiva a la purchase actual. Es temporal, retryable, hace rollback completo de FASE B, mantiene la key `IN_PROGRESS` con lease liberado y no se persiste como `FAILED`.
+
+`PURCHASE_REPLENISHMENT_INCONSISTENT` ocurre cuando el `DRAFT` puede coincidir con el fingerprint, pero el estado interno de reposicion impide materializar un plan SAFE ya cerrado: position esperada inexistente, mismatch de `branch/product/channel`, committed insuficiente, demand insuficiente para `PURCHASE_FULFILL`, allocation no terminalizable, source planning imposible despues de SAFE, incompatibilidad entre detail/movement/position o cualquier reconciliacion interna que produciria negativos. Es deterministico para el estado observado y puede persistirse como `FAILED` en FASE C.
 
 Los errores de idempotencia se resuelven por contrato de la key. No deben mezclarse mecanicamente con errores operativos de FASE B.
 
@@ -1724,13 +1985,22 @@ Queda congelado el prefijo y el bloque de validaciones del `DRAFT` antes de cual
 37. Si es SAFE, registrar `planned_fulfill_delta = safe_fulfill_now` y consumir `planned_remaining_received_applicable`; nunca puede ser negativo y, si llega a `0`, las allocations posteriores reciben `receipt_cap = 0`.
 38. Solo cuando toda la compra tenga plan SAFE, construir capacidades source REPLENISHMENT-FIRST por `purchase_order_item` recorriendo `purchase_items` en source FIFO `line_number ASC, id ASC`.
 39. Consumir source capacities acumulativamente contra allocations destino para producir `detail_delta`, sin reiniciar capacidad por allocation.
-40. Persistir, en la misma transaccion, cada `detail_delta > 0` en `replenishment_allocation_fulfillments` y el incremento de `replenishment_allocations.fulfilled_qty_base` con `old_allocation_fulfilled_qty_base + planned_fulfill_delta`.
-41. Verificar reconciliacion: `SUM(new detail rows)=planned_fulfill_delta` y `SUM(all historical detail rows)=new_allocation_fulfilled_qty_base`.
-42. Si `planned_fulfill_delta = 0`, no insertar detail rows para esa allocation.
-43. Continuar hacia `PURCHASE_FULFILL`, `ORDER_RELEASE`, inventario y effects/locks todavia pendientes fuera del detail db-4.
-44. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
+40. Para cada allocation, calcular `planned_release_delta = remaining_reserved - planned_fulfill_delta`.
+41. Validar terminalizacion: `planned_fulfill_delta + planned_release_delta = remaining_reserved` y, al aplicar, `new_fulfilled_qty_base + new_released_qty_base = reserved_qty_base`.
+42. Planear `PURCHASE_FULFILL` para cada `planned_fulfill_delta > 0` y `ORDER_RELEASE` para cada `planned_release_delta > 0`, ambos referenciando `replenishment_allocations.id`.
+43. Agrupar `planned_fulfill_delta` y `planned_release_delta` por `branch_id`, `product_id`, `channel`.
+44. Validar que cada `replenishment_positions` esperada exista, coincida exactamente con las keys de sus allocations y que aplicar los deltas no produzca negativos.
+45. Persistir, en la misma transaccion, cada `detail_delta > 0` en `replenishment_allocation_fulfillments` y el incremento de `replenishment_allocations.fulfilled_qty_base` con `old_allocation_fulfilled_qty_base + planned_fulfill_delta`.
+46. Persistir el incremento de `replenishment_allocations.released_qty_base` con `old_allocation_released_qty_base + planned_release_delta`.
+47. Insertar solo movements no-cero: `PURCHASE_FULFILL` por allocation fulfilled y `ORDER_RELEASE` por allocation released.
+48. Actualizar `replenishment_positions` agregadas: `demand_qty_base = old - total_fulfilled`, `committed_qty_base = old - total_fulfilled - total_released`.
+49. Incrementar `replenishment_positions.version = version + 1` exactamente una vez por position modificada.
+50. Verificar reconciliacion: `SUM(new detail rows)=planned_fulfill_delta`, `SUM(all historical detail rows)=new_allocation_fulfilled_qty_base`, movements equivalen a los deltas agregados y cada position refleja exactamente esos deltas.
+51. Si `planned_fulfill_delta = 0`, no insertar detail rows ni `PURCHASE_FULFILL` para esa allocation; si `planned_release_delta = 0`, no insertar `ORDER_RELEASE` para esa allocation.
+52. Continuar hacia inventario, costo promedio, locks globales, audit y effects todavia pendientes.
+53. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
 
-No se introducen todavia locks de inventario/reposicion. No se producen efectos antes de completar todas las validaciones cerradas del `DRAFT` y antes de superar la evaluacion SAFE EARLY RESOLUTION.
+No se introducen todavia locks de inventario ni el orden global final de locks de reposicion/inventario. No se producen efectos antes de completar todas las validaciones cerradas del `DRAFT`, superar la evaluacion SAFE EARLY RESOLUTION y validar la consistencia de reposicion cerrada en este micro-hito.
 
 La consistencia supplier/product business puede validarse antes del fingerprint porque protege tenant/integridad. La semantica fiscal completa de `tax_snapshot` v1 queda definida por `docs/domain/tax-snapshot-v1.md` y se valida antes de efectos.
 
@@ -1758,7 +2028,7 @@ entonces:
 
 No crear otro audit de confirmacion.
 
-No modificar inventario/reposicion.
+No modificar inventario/reposicion. En particular, no reinsertar `replenishment_allocation_fulfillments`, no recrear `PURCHASE_FULFILL`, no recrear `ORDER_RELEASE`, no volver a actualizar `replenishment_positions` y no volver a terminalizar `replenishment_allocations`.
 
 ## 36. Estado inconsistente
 
@@ -1815,7 +2085,8 @@ Errores deterministicos de este micro-hito que pueden llegar a FASE C:
 - `PURCHASE_QUANTITY_INVALID`;
 - `PURCHASE_DIFFERENCE_REASON_REQUIRED`;
 - `PURCHASE_TOTALS_INVALID`;
-- `PURCHASE_TAX_INVALID`.
+- `PURCHASE_TAX_INVALID`;
+- `PURCHASE_REPLENISHMENT_INCONSISTENT`.
 
 No se agregan a FASE C en este micro-hito:
 
@@ -1824,6 +2095,8 @@ No se agregan a FASE C en este micro-hito:
 - `PRODUCT_UNIT_INVALID`.
 
 `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` se agrega al catalogo conceptual de resultados/condiciones de `CONFIRM_PURCHASE`, pero no pertenece a la lista de errores deterministicos persistidos como `FAILED` en FASE C. Es una condicion temporal y retryable sobre la misma key/hash.
+
+`PURCHASE_REPLENISHMENT_INCONSISTENT` si pertenece a FASE C: despues del `ROLLBACK` completo de FASE B, la transaccion corta de FASE C puede persistir `FAILED` con ese `error_code` original porque el estado observado no permite materializar el plan sin violar invariantes internas de reposicion.
 
 Tratamiento especifico de `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`:
 
@@ -1942,10 +2215,6 @@ El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no
 
 Antes de congelar `CONFIRM_PURCHASE v0.1`, faltan:
 
-- `PURCHASE_FULFILL` definitivo;
-- `ORDER_RELEASE` definitivo;
-- movements y positions de reposicion;
-- `replenishment_positions` updates definitivos;
 - inventory effects;
 - costo promedio;
 - orden global de locks;
@@ -1983,4 +2252,18 @@ No quedan como pendientes en este borrador:
 - multiples `purchase_items` por `purchase_order_item`;
 - trazabilidad exacta `purchase_item -> fulfilled_qty_base -> replenishment_allocation`;
 - distribucion de `received_applicable_to_replenishment_base` entre allocations SAFE;
+- `planned_release_delta` definitivo;
+- terminalizacion de `replenishment_allocations` al confirmar compra;
+- `PURCHASE_FULFILL` definitivo;
+- `ORDER_RELEASE` definitivo;
+- granularidad de `replenishment_movements` por allocation y tipo no-cero;
+- referencia `replenishment_allocations` para `PURCHASE_FULFILL` y `ORDER_RELEASE`;
+- deltas agregados definitivos de `replenishment_positions`;
+- `available_to_order_base` generado y no escrito manualmente;
+- `version + 1` una vez por position modificada;
+- no compensacion cross-channel;
+- `PURCHASE_REPLENISHMENT_INCONSISTENT` como inconsistencia deterministica de reposicion;
+- reconciliacion allocation / movement / position;
+- atomicidad local del bloque de reposicion dentro de FASE B;
+- replay/recovery sin duplicar detail, movements, positions ni terminalizacion;
 - condicion retryable `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` sin FASE C `FAILED`.
