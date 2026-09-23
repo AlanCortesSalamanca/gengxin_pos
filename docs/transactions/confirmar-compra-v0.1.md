@@ -59,6 +59,13 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 - deltas exactos de `replenishment_positions` para reposicion;
 - granularidad y referencia de `replenishment_movements` de compra;
 - reconciliacion allocation / movement / position para reposicion;
+- entrada fisica de compra a inventario;
+- `PURCHASE_RECEIPT` definitivo;
+- costo promedio ponderado para recepciones de compra;
+- actualizacion semantica de `inventory_balances`;
+- `balance_after_base` para `PURCHASE_RECEIPT`;
+- reconciliacion de inventario;
+- `PURCHASE_INVENTORY_INCONSISTENT`;
 - errores de validacion del `DRAFT` cerrados hasta este micro-hito;
 - estados base;
 - recuperacion historica;
@@ -66,12 +73,10 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 
 Este borrador todavia deja abiertos:
 
-- inventory effects;
-- costo promedio;
 - orden global final de locks;
 - isolation final;
 - audit payload;
-- atomicidad definitiva.
+- atomicidad global definitiva.
 
 Este documento no queda validado ni congelado.
 
@@ -1387,10 +1392,423 @@ Casos minimos cerrados:
 - Caso A: `remaining_reserved = 10`, `received_applicable = 10`, `F = 10`, `R = 0`; position `demand -10`, `committed -10`; movement `PURCHASE_FULFILL 10`.
 - Caso B: `remaining_reserved = 10`, `received_applicable = 6`, `F = 6`, `R = 4`; position `demand -6`, `committed -10`; movements `PURCHASE_FULFILL 6` y `ORDER_RELEASE 4`.
 - Caso C: `remaining_reserved = 10`, `received_applicable = 0`, `F = 0`, `R = 10`; position `demand 0`, `committed -10`; movement `ORDER_RELEASE 10`.
-- Caso D: `remaining_reserved = 10`, `received_applicable = 14`; `F maximo = 10`, `R = 0`; excedente fisico `4` no crea reposicion nueva y queda para inventario pendiente.
+- Caso D: `remaining_reserved = 10`, `received_applicable = 14`; `F maximo = 10`, `R = 0`; excedente fisico `4` no crea reposicion nueva y entra a inventario por el bloque cerrado de `PURCHASE_RECEIPT`.
 - Caso E: allocations remaining `3 / 4 / 3`, `received_applicable = 6`; resultado `A F3 R0`, `B F3 R1`, `C F0 R3`; totales `F = 6`, `R = 4`; position `demand -6`, `committed -10`.
 
 Interaccion cerrada con `RETURN_RESTOCK`: si `reserved remaining = 10`, demanda actual restante por returns `= 6` y `received_applicable >= 10`, SAFE produce `F = 6` y `R = 4`. No fulfillar `10`; no reducir demand por release. Esto conserva la regla ya congelada de `CONFIRM_RETURN`: `RETURN_RESTOCK` reduce demanda pero no modifica compromiso, por lo que `committed > demand` puede ser temporalmente valido hasta resolver la compra.
+
+### Inventory receipt y costo promedio ponderado
+
+Decision definitiva: toda cantidad fisicamente recibida y aceptada en `purchase_items.received_qty_base` entra al inventario vendible de la sucursal de la compra.
+
+Por cada `purchase_item`:
+
+```text
+inventory_receipt_qty_base = purchase_items.received_qty_base
+```
+
+Si `received_qty_base > 0`, toda esa cantidad entra a `inventory_balances` para:
+
+```text
+(purchases.branch_id, purchase_items.product_id)
+```
+
+Esto aplica sin importar si la linea:
+
+- corresponde a replenishment;
+- corresponde a customer_special;
+- corresponde a stock_extra;
+- mezcla razones en el `purchase_order_item`;
+- tiene `purchase_order_item_id IS NULL` porque fue mercancia no pedida.
+
+La logica de replenishment no limita inventory receipt. Ejemplo:
+
+```text
+purchase_order_item:
+  replenishment = 5
+  stock_extra = 5
+
+received = 10
+
+inventory receipt = 10
+```
+
+Aunque el replenishment fulfillment pueda ser como maximo `5`, inventario recibe `10`.
+
+Si `received_qty_base = 0`:
+
+- no crear `PURCHASE_RECEIPT`;
+- no modificar `inventory_balances`;
+- no modificar `average_cost_base`;
+- no modificar `version`.
+
+### Costo unitario autoritativo de PURCHASE_RECEIPT
+
+Para `PURCHASE_RECEIPT`:
+
+```text
+unit_cost_base = purchase_items.actual_unit_cost_base
+```
+
+Este valor es el costo unitario real aceptado en unidad base, neto antes de impuestos.
+
+No usar:
+
+- `purchase_order_items.expected_unit_cost_base`;
+- `product_suppliers.unit_cost_reference`;
+- costo de catalogo vivo;
+- `inventory_balances.average_cost_base` previo;
+- `subtotal / received_qty` recalculado como sustituto;
+- impuestos;
+- total con impuestos.
+
+`actual_unit_cost_base = 0` es valido. Si la cantidad recibida es positiva y el costo es `0`, la entrada tiene valor recibido `0` y participa normalmente en el promedio ponderado.
+
+### Agregacion por balance
+
+Antes de actualizar `inventory_balances`, agrupar todas las `purchase_items` positivas por:
+
+```text
+(branch_id, product_id)
+```
+
+Para cada grupo:
+
+```text
+received_qty_total =
+  SUM(received_qty_base)
+
+received_value_total =
+  SUM(received_qty_base * actual_unit_cost_base)
+```
+
+Usar aritmetica `NUMERIC` exacta. No usar `FLOAT`.
+
+No redondear un promedio intermedio por `purchase_item`. Calcular el promedio una sola vez por balance usando el agregado completo del producto.
+
+### Balance existente
+
+Sea:
+
+```text
+Q = old inventory_balances.quantity_base
+A = old inventory_balances.average_cost_base
+R = received_qty_total
+V = received_value_total
+```
+
+Entonces:
+
+```text
+new_quantity_base = Q + R
+```
+
+Si `Q > 0`:
+
+```text
+new_average_cost_base =
+  ROUND(
+    ((Q * A) + V) / (Q + R),
+    6
+  )
+```
+
+Si `Q = 0`:
+
+```text
+new_average_cost_base =
+  ROUND(V / R, 6)
+```
+
+`R` siempre debe ser mayor a `0` para que el balance forme parte de este bloque.
+
+No usar subtotal monetario redondeado a 2 decimales para calcular `average_cost_base`. El promedio ponderado usa `received_qty_base * actual_unit_cost_base` con precision decimal y solo redondea el promedio final persistido a 6 decimales.
+
+### Balance inexistente
+
+Si no existe `inventory_balances(branch_id, product_id)` y existe `received_qty_total > 0`, crear el balance con:
+
+```text
+quantity_base = received_qty_total
+
+average_cost_base =
+  ROUND(received_value_total / received_qty_total, 6)
+```
+
+db-4 define `inventory_balances.version DEFAULT 0`. No inventar `version = 1` para `INSERT`.
+
+Para una fila nueva:
+
+```text
+version = 0
+```
+
+mediante el default normal de db-4.
+
+Para una fila ya existente que `CONFIRM_PURCHASE` actualiza:
+
+```text
+version = version + 1
+```
+
+exactamente una vez por `(branch_id, product_id)`, aunque existan varias `purchase_items` de ese producto. No incrementar `version` por `inventory_movement`.
+
+### PURCHASE_RECEIPT
+
+Crear exactamente un `inventory_movements` por cada `purchase_item` con `received_qty_base > 0`:
+
+```text
+movement_type = 'PURCHASE_RECEIPT'
+branch_id = purchases.branch_id
+product_id = purchase_items.product_id
+quantity_delta_base = purchase_items.received_qty_base
+unit_cost_base = purchase_items.actual_unit_cost_base
+reference_entity_type = 'purchase_items'
+reference_entity_id = purchase_items.id
+actor_user_id = actor actual autorizado de CONFIRM_PURCHASE
+```
+
+No crear movement si `received_qty_base = 0`.
+
+No agregar varios `purchase_items` del mismo producto en un unico movement. `inventory_balances` puede actualizarse agregado; `inventory_movements` conserva granularidad por `purchase_item`.
+
+### balance_after_base de PURCHASE_RECEIPT
+
+`balance_after_base` queda cerrado para `PURCHASE_RECEIPT` y no debe quedar `NULL` en el camino normal de `CONFIRM_PURCHASE`.
+
+Para cada producto, ordenar solamente las `purchase_items` positivas por:
+
+1. `purchase_items.line_number ASC`.
+2. `purchase_items.id ASC`.
+
+Sea `Q` el balance autoritativo anterior a esta compra. Para movement `i`:
+
+```text
+balance_after_base(i) =
+  Q
+  + SUM(received_qty_base de las lineas positivas
+        del mismo producto hasta i inclusive)
+```
+
+Esto sirve solo para determinar el saldo historico posterior a cada movement. No recalcular `average_cost_base` secuencialmente en ese orden. El costo promedio sigue calculandose una sola vez con el agregado total del producto.
+
+El ultimo `balance_after_base` del producto debe coincidir con `inventory_balances.quantity_base` despues de materializar el bloque.
+
+### Producto no pedido
+
+Si:
+
+```text
+purchase_items.purchase_order_item_id IS NULL
+AND received_qty_base > 0
+```
+
+debe:
+
+- entrar completo a `inventory_balances`;
+- crear `PURCHASE_RECEIPT`;
+- usar `actual_unit_cost_base`;
+- participar en weighted average.
+
+No crear replenishment fulfillment por esta razon. No crear `purchase_order_item` retrospectivo.
+
+### Reconciliacion de inventario
+
+Por purchase:
+
+```text
+SUM(PURCHASE_RECEIPT.quantity_delta_base)
+=
+SUM(purchase_items.received_qty_base WHERE received_qty_base > 0)
+```
+
+Por `purchase + branch + product`:
+
+```text
+SUM(PURCHASE_RECEIPT.quantity_delta_base)
+= received_qty_total
+```
+
+Por movement:
+
+```text
+inventory_movements.unit_cost_base
+= purchase_items.actual_unit_cost_base
+
+reference_entity_type = 'purchase_items'
+reference_entity_id = purchase_items.id
+```
+
+Por balance:
+
+```text
+new quantity_base = old quantity_base + received_qty_total
+```
+
+Para cada producto:
+
+```text
+ultimo PURCHASE_RECEIPT.balance_after_base
+= new inventory_balances.quantity_base
+```
+
+Para costo, `new average_cost_base` debe ser exactamente el promedio ponderado agregado definido en este contrato, redondeado una sola vez a 6 decimales.
+
+No exigir movement para `purchase_item` con `received_qty_base = 0`.
+
+### PURCHASE_INVENTORY_INCONSISTENT
+
+Codigo estable:
+
+```text
+PURCHASE_INVENTORY_INCONSISTENT
+```
+
+Usarlo solo para inconsistencias internas deterministicas del bloque de inventario una vez observado estado autoritativo protegido por los locks que correspondan.
+
+Ejemplos:
+
+- reconciliacion movement/balance imposible;
+- calculo de balance produciria estado invalido;
+- movement planificado no coincide con `purchase_item`;
+- balance resultante no coincide con deltas planificados;
+- ultimo `balance_after_base` no coincide con `new quantity_base`;
+- weighted average persistido no coincide con el calculo canonico;
+- identidad `branch/product` inconsistente despues de validaciones ya cerradas.
+
+No usarlo para:
+
+- `received_qty_base = 0`;
+- `actual_unit_cost_base = 0`;
+- `PURCHASE_DRAFT_STALE`;
+- lock contention;
+- deadlock;
+- serialization failure;
+- unique violation provocada por carrera tecnica;
+- fallos tecnicos de infraestructura.
+
+Los ultimos son fallos tecnicos/retryables segun el contrato global futuro y no deben convertirse artificialmente en `FAILED` deterministico.
+
+Si `PURCHASE_INVENTORY_INCONSISTENT` ocurre como inconsistencia deterministica real:
+
+- `ROLLBACK` completo de FASE B;
+- puede persistirse `FAILED` en FASE C con el `error_code` original.
+
+### Atomicidad local de inventario
+
+Dentro de la misma FASE B deben quedar juntos:
+
+- `inventory_balances.quantity_base`;
+- `inventory_balances.average_cost_base`;
+- `inventory_balances.version` cuando sea `UPDATE`;
+- creacion de `inventory_balances` cuando no exista;
+- todos los `PURCHASE_RECEIPT`;
+- sus `balance_after_base`;
+- los efectos de replenishment ya cerrados en micro-hitos anteriores.
+
+Si falla cualquiera, `ROLLBACK` completo de FASE B. Este micro-hito no cierra todavia el `COMMIT` global final.
+
+Los efectos de inventory y replenishment conviven en la misma FASE B. Antes de las mutaciones deberan estar adquiridos todos los locks necesarios segun el contrato global que se cerrara despues. Este documento cierra semantica de efectos, no el orden final de locks.
+
+### Replay y recovery de inventario
+
+Replay `COMPLETED` o reconciliacion historica exitosa:
+
+- no vuelve a incrementar `inventory_balances`;
+- no recalcula `average_cost_base`;
+- no incrementa `version` otra vez;
+- no recrea `PURCHASE_RECEIPT`;
+- no vuelve a insertar balances;
+- no repite replenishment effects.
+
+No crear nueva identidad fisica para deduplicar movements en este micro-hito. La proteccion primaria sigue dependiendo del contrato idempotente y la atomicidad de `CONFIRM_PURCHASE`.
+
+### Concurrencia de inventario: recursos, no orden global
+
+Este bloque requiere proteger `inventory_balances(branch_id, product_id)` para todos los productos positivos de la purchase.
+
+Riesgos que deben impedirse:
+
+- lost update de `quantity_base`;
+- lost update de `average_cost_base`;
+- dos creaciones concurrentes del mismo balance inexistente;
+- ledger creado sin balance correspondiente;
+- balance actualizado sin ledger correspondiente.
+
+`product_id` queda como candidato de orden estable dentro de una sucursal.
+
+No se congela todavia el orden global respecto de:
+
+- `purchase`;
+- `purchase_items`;
+- `sale_items`;
+- `replenishment_positions`;
+- `replenishment_allocations`;
+- `inventory_balances`;
+- `audit`.
+
+Ese sera otro micro-hito.
+
+### Casos minimos de inventario
+
+Caso A:
+
+```text
+old Q = 10
+old A = 100
+receive 5 @ 120
+
+new Q = 15
+new A = 106.666667
+```
+
+Caso B:
+
+```text
+balance inexistente
+receive 5 @ 120
+
+new Q = 5
+new A = 120.000000
+fila nueva version = 0
+```
+
+Caso C:
+
+```text
+mismo producto:
+  3 @ 100
+  7 @ 130
+
+received qty = 10
+received value = 3*100 + 7*130 = 1210
+avg si Q inicial 0 = 121.000000
+```
+
+Crear dos `PURCHASE_RECEIPT`: uno por `3 @ 100` y otro por `7 @ 130`. Si `Q` inicial era `0`, sus `balance_after_base` son `3` y `10` respectivamente, pero `inventory_balances` se materializa una sola vez con `quantity_base = 10` y `average_cost_base = 121.000000`.
+
+Caso D: `received_qty_base = 0` no crea movement, no tiene efecto de balance y no afecta `version`.
+
+Caso E: `received_qty_base > 0` y `actual_unit_cost_base = 0` es entrada valida y participa en weighted average normal.
+
+Ejemplo de costo cero:
+
+```text
+old Q = 10
+old A = 100
+received R = 5
+unit cost = 0
+V = 0
+
+new Q = 15
+new average = ROUND((10 * 100) / 15, 6)
+```
+
+Caso F: `purchase_order_item_id IS NULL` y `received_qty_base > 0` entra completa a inventario y crea `PURCHASE_RECEIPT`.
+
+Caso G: `replenishment = 5`, `stock_extra = 5`, `received = 10`; inventario aumenta `10` y replenishment fulfillment conserva su cap independiente.
+
+Caso H: dos compras concurrentes del mismo `branch/product` deben impedir lost updates de cantidad y costo promedio mediante proteccion de `inventory_balances`; el orden global de locks sigue pendiente.
 
 ### difference_reason
 
@@ -1602,7 +2020,7 @@ Debe hacer rollback y devolver error deterministico. El usuario/flujo de edicion
 
 ## 20. Catalogo de errores cerrado hasta este micro-hito
 
-Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto solo en lo que dependa de inventario y costo promedio.
+Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto solo en lo que dependa de locks globales, isolation, audit y atomicidad global final.
 
 Idempotencia:
 
@@ -1650,6 +2068,10 @@ Reposicion:
 - `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`;
 - `PURCHASE_REPLENISHMENT_INCONSISTENT`.
 
+Inventario:
+
+- `PURCHASE_INVENTORY_INCONSISTENT`.
+
 No se crean errores de:
 
 - `PURCHASE_BRANCH_MISMATCH`;
@@ -1657,8 +2079,7 @@ No se crean errores de:
 - `SUPPLIER_INACTIVE`;
 - `PRODUCT_INACTIVE`;
 - `PRODUCT_UNIT_INVALID`;
-- inventario;
-- costo promedio.
+- otro error de costo promedio.
 
 No se crea `PURCHASE_EMPTY` ni equivalente.
 
@@ -1706,6 +2127,8 @@ No usar `PURCHASE_DRAFT_STALE` cuando el contenido persistido coincide con el fi
 `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` ocurre cuando una reservation historica anterior todavia activa puede cambiar cuanto fulfillment corresponde de forma definitiva a la purchase actual. Es temporal, retryable, hace rollback completo de FASE B, mantiene la key `IN_PROGRESS` con lease liberado y no se persiste como `FAILED`.
 
 `PURCHASE_REPLENISHMENT_INCONSISTENT` ocurre cuando el `DRAFT` puede coincidir con el fingerprint, pero el estado interno de reposicion impide materializar un plan SAFE ya cerrado: position esperada inexistente, mismatch de `branch/product/channel`, committed insuficiente, demand insuficiente para `PURCHASE_FULFILL`, allocation no terminalizable, source planning imposible despues de SAFE, incompatibilidad entre detail/movement/position o cualquier reconciliacion interna que produciria negativos. Es deterministico para el estado observado y puede persistirse como `FAILED` en FASE C.
+
+`PURCHASE_INVENTORY_INCONSISTENT` ocurre cuando el estado autoritativo protegido por los locks que correspondan no permite materializar el bloque de inventario sin violar invariantes internas: reconciliacion movement/balance imposible, calculo de balance invalido, movement planificado que no coincide con `purchase_item`, balance resultante distinto de los deltas planificados, ultimo `balance_after_base` distinto del nuevo `quantity_base`, weighted average persistido distinto del calculo canonico o identidad `branch/product` inconsistente despues de validaciones ya cerradas. No se usa para `received_qty_base = 0`, `actual_unit_cost_base = 0`, stale del DRAFT, lock contention, deadlock, serialization failure, unique violation por carrera tecnica ni fallos de infraestructura. Es deterministico para el estado observado y puede persistirse como `FAILED` en FASE C.
 
 Los errores de idempotencia se resuelven por contrato de la key. No deben mezclarse mecanicamente con errores operativos de FASE B.
 
@@ -1813,6 +2236,11 @@ No:
 - reautorizar para ese replay historico exacto;
 - repetir locks de negocio innecesarios;
 - repetir inventario;
+- incrementar `inventory_balances`;
+- recalcular `average_cost_base`;
+- incrementar `inventory_balances.version` otra vez;
+- recrear `PURCHASE_RECEIPT`;
+- insertar balances nuevamente;
 - repetir fulfillment;
 - repetir audit.
 
@@ -1989,18 +2417,23 @@ Queda congelado el prefijo y el bloque de validaciones del `DRAFT` antes de cual
 41. Validar terminalizacion: `planned_fulfill_delta + planned_release_delta = remaining_reserved` y, al aplicar, `new_fulfilled_qty_base + new_released_qty_base = reserved_qty_base`.
 42. Planear `PURCHASE_FULFILL` para cada `planned_fulfill_delta > 0` y `ORDER_RELEASE` para cada `planned_release_delta > 0`, ambos referenciando `replenishment_allocations.id`.
 43. Agrupar `planned_fulfill_delta` y `planned_release_delta` por `branch_id`, `product_id`, `channel`.
-44. Validar que cada `replenishment_positions` esperada exista, coincida exactamente con las keys de sus allocations y que aplicar los deltas no produzca negativos.
-45. Persistir, en la misma transaccion, cada `detail_delta > 0` en `replenishment_allocation_fulfillments` y el incremento de `replenishment_allocations.fulfilled_qty_base` con `old_allocation_fulfilled_qty_base + planned_fulfill_delta`.
-46. Persistir el incremento de `replenishment_allocations.released_qty_base` con `old_allocation_released_qty_base + planned_release_delta`.
-47. Insertar solo movements no-cero: `PURCHASE_FULFILL` por allocation fulfilled y `ORDER_RELEASE` por allocation released.
-48. Actualizar `replenishment_positions` agregadas: `demand_qty_base = old - total_fulfilled`, `committed_qty_base = old - total_fulfilled - total_released`.
-49. Incrementar `replenishment_positions.version = version + 1` exactamente una vez por position modificada.
-50. Verificar reconciliacion: `SUM(new detail rows)=planned_fulfill_delta`, `SUM(all historical detail rows)=new_allocation_fulfilled_qty_base`, movements equivalen a los deltas agregados y cada position refleja exactamente esos deltas.
-51. Si `planned_fulfill_delta = 0`, no insertar detail rows ni `PURCHASE_FULFILL` para esa allocation; si `planned_release_delta = 0`, no insertar `ORDER_RELEASE` para esa allocation.
-52. Continuar hacia inventario, costo promedio, locks globales, audit y effects todavia pendientes.
-53. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
+44. Validar conceptualmente que cada `replenishment_positions` esperada exista, coincida exactamente con las keys de sus allocations y que aplicar los deltas no produzca negativos.
+45. Planear inventory receipt: seleccionar `purchase_items.received_qty_base > 0`; si no hay lineas positivas, no hay `PURCHASE_RECEIPT` ni efecto de balance.
+46. Agrupar inventory receipt por `(branch_id, product_id)` y calcular `received_qty_total` y `received_value_total` con `NUMERIC` exacto.
+47. Para cada balance afectado, leer el saldo autoritativo protegido por los locks que correspondan y planear `new_quantity_base` y `new_average_cost_base` segun promedio ponderado agregado.
+48. Para balances inexistentes con `received_qty_total > 0`, planear creacion con `version = 0` por default db-4; para balances existentes, planear `version = version + 1` exactamente una vez por `(branch_id, product_id)`.
+49. Planear un `PURCHASE_RECEIPT` por cada `purchase_item` positiva, con `unit_cost_base = actual_unit_cost_base`, referencia a `purchase_items.id` y `balance_after_base` deterministico por producto ordenando `purchase_items.line_number ASC, id ASC`.
+50. Verificar plan de inventario: movements equivalen a `received_qty_base`, ultimo `balance_after_base` por producto coincide con `new quantity_base`, costo promedio usa el calculo canonico y no hay efecto para lineas con cantidad cero.
+51. Antes de materializar efectos de replenishment o inventario, deben estar adquiridos todos los locks necesarios segun el contrato global pendiente. Este micro-hito no fija el orden global final de locks.
+52. Bajo esos locks, materializar en la misma FASE B los efectos de replenishment ya cerrados: detail, allocation fulfillment/release, `PURCHASE_FULFILL`, `ORDER_RELEASE`, `replenishment_positions` agregadas y `version` de positions.
+53. Bajo esos locks, materializar en la misma FASE B los efectos de inventario cerrados: crear o actualizar `inventory_balances`, recalcular `average_cost_base`, incrementar `version` solo en UPDATE e insertar todos los `PURCHASE_RECEIPT` con `balance_after_base`.
+54. Verificar reconciliacion de reposicion: `SUM(new detail rows)=planned_fulfill_delta`, `SUM(all historical detail rows)=new_allocation_fulfilled_qty_base`, movements equivalen a los deltas agregados y cada position refleja exactamente esos deltas.
+55. Verificar reconciliacion de inventario: movements equivalen a cantidades recibidas positivas, unit costs coinciden con `actual_unit_cost_base`, balances reflejan los deltas agregados y el promedio ponderado persistido coincide con el calculo canonico.
+56. Si `planned_fulfill_delta = 0`, no insertar detail rows ni `PURCHASE_FULFILL` para esa allocation; si `planned_release_delta = 0`, no insertar `ORDER_RELEASE` para esa allocation; si `received_qty_base = 0`, no insertar `PURCHASE_RECEIPT` ni tocar balance por esa linea.
+57. Continuar hacia locks globales finales, isolation, audit, estados finales y atomicidad global todavia pendientes.
+58. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
 
-No se introducen todavia locks de inventario ni el orden global final de locks de reposicion/inventario. No se producen efectos antes de completar todas las validaciones cerradas del `DRAFT`, superar la evaluacion SAFE EARLY RESOLUTION y validar la consistencia de reposicion cerrada en este micro-hito.
+No se introduce todavia el orden global final de locks de reposicion/inventario. Los efectos de inventory y replenishment conviven en la misma FASE B y deben materializarse bajo todos los locks necesarios cuando el contrato global se cierre. No se producen efectos antes de completar todas las validaciones cerradas del `DRAFT`, superar la evaluacion SAFE EARLY RESOLUTION y validar la consistencia de reposicion e inventario cerrada hasta este micro-hito.
 
 La consistencia supplier/product business puede validarse antes del fingerprint porque protege tenant/integridad. La semantica fiscal completa de `tax_snapshot` v1 queda definida por `docs/domain/tax-snapshot-v1.md` y se valida antes de efectos.
 
@@ -2028,7 +2461,7 @@ entonces:
 
 No crear otro audit de confirmacion.
 
-No modificar inventario/reposicion. En particular, no reinsertar `replenishment_allocation_fulfillments`, no recrear `PURCHASE_FULFILL`, no recrear `ORDER_RELEASE`, no volver a actualizar `replenishment_positions` y no volver a terminalizar `replenishment_allocations`.
+No modificar inventario/reposicion. En particular, no reinsertar `replenishment_allocation_fulfillments`, no recrear `PURCHASE_FULFILL`, no recrear `ORDER_RELEASE`, no volver a actualizar `replenishment_positions`, no volver a terminalizar `replenishment_allocations`, no incrementar `inventory_balances`, no recalcular `average_cost_base`, no incrementar `inventory_balances.version`, no reinsertar `PURCHASE_RECEIPT` y no volver a crear balances.
 
 ## 36. Estado inconsistente
 
@@ -2086,7 +2519,8 @@ Errores deterministicos de este micro-hito que pueden llegar a FASE C:
 - `PURCHASE_DIFFERENCE_REASON_REQUIRED`;
 - `PURCHASE_TOTALS_INVALID`;
 - `PURCHASE_TAX_INVALID`;
-- `PURCHASE_REPLENISHMENT_INCONSISTENT`.
+- `PURCHASE_REPLENISHMENT_INCONSISTENT`;
+- `PURCHASE_INVENTORY_INCONSISTENT`.
 
 No se agregan a FASE C en este micro-hito:
 
@@ -2097,6 +2531,8 @@ No se agregan a FASE C en este micro-hito:
 `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` se agrega al catalogo conceptual de resultados/condiciones de `CONFIRM_PURCHASE`, pero no pertenece a la lista de errores deterministicos persistidos como `FAILED` en FASE C. Es una condicion temporal y retryable sobre la misma key/hash.
 
 `PURCHASE_REPLENISHMENT_INCONSISTENT` si pertenece a FASE C: despues del `ROLLBACK` completo de FASE B, la transaccion corta de FASE C puede persistir `FAILED` con ese `error_code` original porque el estado observado no permite materializar el plan sin violar invariantes internas de reposicion.
+
+`PURCHASE_INVENTORY_INCONSISTENT` si pertenece a FASE C: despues del `ROLLBACK` completo de FASE B, la transaccion corta de FASE C puede persistir `FAILED` con ese `error_code` original porque el estado observado no permite materializar el bloque de inventario sin violar invariantes internas. No convertir en este error los fallos tecnicos/retryables como deadlock, serialization failure, lock contention, unique violation por carrera tecnica o infraestructura.
 
 Tratamiento especifico de `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`:
 
@@ -2179,7 +2615,7 @@ No sustituye idempotencia porque no guarda:
 
 ## 42. Cambio fisico
 
-El cambio fisico requerido por este micro-hito ya fue materializado y congelado en db-4:
+El cambio fisico requerido por los micro-hitos previos de reposicion ya fue materializado y congelado en db-4:
 
 - nueva tabla `replenishment_allocation_fulfillments`;
 - eliminacion de `replenishment_allocations.purchase_item_id`;
@@ -2207,6 +2643,22 @@ Este micro-hito no requiere cambio fisico adicional sobre db-4:
 
 No agregar `CHECKs` adicionales solo porque estas reglas se validen en servicio.
 
+El bloque de inventory receipt y weighted average cost queda cubierto por estructuras ya existentes en db-4:
+
+- `inventory_balances(branch_id, product_id)`;
+- `quantity_base`;
+- `average_cost_base`;
+- `version DEFAULT 0`;
+- `inventory_movements.movement_type = 'PURCHASE_RECEIPT'`;
+- `quantity_delta_base`;
+- `unit_cost_base`;
+- `balance_after_base`;
+- `reference_entity_type`;
+- `reference_entity_id`;
+- `actor_user_id`.
+
+No crear db-5 por este micro-hito.
+
 El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no evolucion fisica del modelo.
 
 `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` es una condicion de servicio, no un nuevo status fisico.
@@ -2215,12 +2667,15 @@ El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no
 
 Antes de congelar `CONFIRM_PURCHASE v0.1`, faltan:
 
-- inventory effects;
-- costo promedio;
 - orden global de locks;
 - `READ COMMITTED` final;
 - audit;
-- atomicidad completa;
+- transicion final `purchases.status = 'CONFIRMED'`;
+- transicion final `purchase_orders.status = 'CLOSED'`;
+- `idempotency_keys.status = 'COMPLETED'` final;
+- `COMMIT` global final;
+- atomicidad global completa;
+- cierre definitivo completo de `CONFIRM_PURCHASE`;
 - pruebas de concurrencia.
 
 No quedan como pendientes en este borrador:
@@ -2266,4 +2721,17 @@ No quedan como pendientes en este borrador:
 - reconciliacion allocation / movement / position;
 - atomicidad local del bloque de reposicion dentro de FASE B;
 - replay/recovery sin duplicar detail, movements, positions ni terminalizacion;
-- condicion retryable `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` sin FASE C `FAILED`.
+- condicion retryable `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` sin FASE C `FAILED`;
+- inventory receipt por `purchase_items.received_qty_base`;
+- `PURCHASE_RECEIPT` por `purchase_item` positiva;
+- costo unitario autoritativo `purchase_items.actual_unit_cost_base`;
+- weighted average cost agregado por `(branch_id, product_id)`;
+- creacion semantica de `inventory_balances` inexistente con `version = 0`;
+- `version + 1` una vez por balance existente actualizado;
+- `balance_after_base` de `PURCHASE_RECEIPT`;
+- producto no pedido entrando completo a inventario;
+- costo cero como entrada valida;
+- reconciliacion de inventario;
+- `PURCHASE_INVENTORY_INCONSISTENT`;
+- atomicidad local del bloque de inventario dentro de FASE B;
+- replay/recovery sin duplicar balances ni `PURCHASE_RECEIPT`.
