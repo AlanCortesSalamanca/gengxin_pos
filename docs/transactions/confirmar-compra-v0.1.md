@@ -4,8 +4,11 @@ Fuente funcional: `especificacion_maestra_pos_multisucursal_v0.5.md`.
 
 Referencia fisica vigente:
 
-- `docs/database/modelo-fisico-v0.5-db-3.md`.
-- `database/schema-v0.5-db-3.sql`.
+- `docs/database/modelo-fisico-v0.5-db-4.md`.
+- `database/schema-v0.5-db-4.sql`.
+- `database/validation-v0.5-db-4.sql`.
+
+La referencia fisica vigente para `CONFIRM_PURCHASE v0.1` es db-4, VALIDADO / CONGELADO. db-3 queda como antecedente historico del modelo que db-4 evoluciona de forma minima para cerrar la trazabilidad cuantitativa de fulfillment de reposicion.
 
 ## Estado del diseno
 
@@ -48,6 +51,8 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 - derivacion/revalidacion fiscal de `tax_total` desde `tax_snapshot` v1;
 - total de linea;
 - sumatorias de cabecera;
+- replenishment fulfillment seguro sobre reservations preexistentes;
+- trazabilidad cuantitativa `purchase_item -> replenishment_allocation` mediante `replenishment_allocation_fulfillments`;
 - errores de validacion del `DRAFT` cerrados hasta este micro-hito;
 - estados base;
 - recuperacion historica;
@@ -57,7 +62,9 @@ Este borrador todavia deja abiertos:
 
 - inventory effects;
 - costo promedio;
-- replenishment fulfillment/release detallado;
+- `PURCHASE_FULFILL` completo fuera de la actualizacion agregada y detail db-4;
+- `ORDER_RELEASE` definitivo;
+- movements y positions de reposicion;
 - orden global final de locks;
 - isolation final;
 - audit payload;
@@ -126,9 +133,9 @@ Las filas persistidas son la autoridad del `DRAFT`:
 - `purchases`;
 - `purchase_items`.
 
-## 5. Verificacion fisica relevante contra db-3
+## 5. Verificacion fisica relevante contra db-4
 
-En `database/schema-v0.5-db-3.sql`, `purchases` tiene:
+En `database/schema-v0.5-db-4.sql`, `purchases` tiene:
 
 - `id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY`;
 - `public_id UUID NOT NULL DEFAULT gen_random_uuid()`;
@@ -166,6 +173,36 @@ En `idempotency_keys`:
 - la unicidad real es `UNIQUE (business_id, operation_type, idempotency_key)`;
 - `operation_type` es `TEXT NOT NULL` con `CHECK (operation_type ~ '^[A-Z_]+$')`, compatible con `CONFIRM_PURCHASE`.
 
+Delta fisico db-4 relevante para este contrato:
+
+- `replenishment_allocations.purchase_item_id` ya no existe como columna vigente.
+- `ck_replenishment_allocations_fulfilled_purchase` ya no existe como constraint vigente.
+- `ix_replenishment_allocations_purchase_item` ya no existe como indice vigente.
+- `replenishment_allocations` conserva cantidades agregadas: `reserved_qty_base`, `fulfilled_qty_base` y `released_qty_base`.
+- `replenishment_allocations` conserva `uq_replenishment_allocations_sale_order UNIQUE (sale_item_id, purchase_order_item_id)`.
+- `replenishment_allocations` expone `uq_replenishment_allocations_id_order_item UNIQUE (id, purchase_order_item_id)`.
+- `purchase_items` expone `uq_purchase_items_id_order_item UNIQUE (id, purchase_order_item_id)`.
+
+Tabla vigente `replenishment_allocation_fulfillments`:
+
+- `id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY`;
+- `replenishment_allocation_id BIGINT NOT NULL`;
+- `purchase_item_id BIGINT NOT NULL`;
+- `purchase_order_item_id BIGINT NOT NULL`;
+- `fulfilled_qty_base NUMERIC(18,4) NOT NULL`;
+- `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`.
+
+Constraints vigentes del detail:
+
+- `ck_replenishment_allocation_fulfillments_qty_positive CHECK (fulfilled_qty_base > 0)`;
+- `uq_replenishment_allocation_fulfillments_alloc_purchase_item UNIQUE (replenishment_allocation_id, purchase_item_id)`;
+- `fk_replenishment_allocation_fulfillments_allocation`;
+- `fk_replenishment_allocation_fulfillments_purchase_item`;
+- `fk_replenishment_allocation_fulfillments_allocation_order_item`;
+- `fk_replenishment_allocation_fulfillments_purchase_item_order`.
+
+Las FKs compuestas del detail garantizan que la allocation y la `purchase_item` pertenezcan al mismo `purchase_order_item`. Una `purchase_item` no pedida (`purchase_order_item_id IS NULL`) no puede participar en `replenishment_allocation_fulfillments`.
+
 ## 6. Campos inmutables del purchase DRAFT
 
 Una vez creada `purchases`, son inmutables a nivel de servicio:
@@ -181,7 +218,7 @@ Una vez creada `purchases`, son inmutables a nivel de servicio:
 - puede ser `NULL`;
 - si ya existe un valor, no puede cambiarse.
 
-Esto no agrega trigger ni constraint. Es contrato de servicio/transaccion sobre db-3.
+Esto no agrega trigger ni constraint. Es contrato de servicio/transaccion sobre db-4.
 
 ## 7. Mutex del purchase DRAFT
 
@@ -274,15 +311,13 @@ Las lineas persistidas son la autoridad.
 
 `CONFIRM_PURCHASE` no reconstruye el `DRAFT` desde lineas reenviadas por el cliente.
 
-No existe error `PURCHASE_EMPTY` en este contrato. El negocio puede confirmar una recepcion donde nada llego. Puede existir una compra sin lineas recibidas persistidas o con lineas `received_qty = 0`, segun se cierre posteriormente la persistencia del DRAFT. `CONFIRM_PURCHASE` debe poder representar que fisicamente no llego mercancia; la resolucion de reservas corresponde al futuro bloque de fulfillment/release.
+No existe error `PURCHASE_EMPTY` en este contrato. El negocio puede confirmar una recepcion donde nada llego. Puede existir una compra sin lineas recibidas persistidas o con lineas `received_qty = 0`, segun se cierre posteriormente la persistencia del DRAFT. `CONFIRM_PURCHASE` debe poder representar que fisicamente no llego mercancia; el fulfillment seguro se resuelve con `safe_fulfill_now = 0` y la liberacion restante queda para `ORDER_RELEASE`.
 
 ## 12. expected_purchase_fingerprint
 
 `expected_purchase_fingerprint` es precondicion obligatoria del comando.
 
-No es columna.
-
-No requiere db-4.
+No es columna. db-4 no agrega una columna para persistirlo.
 
 Significado:
 
@@ -552,7 +587,7 @@ No usar `PURCHASE_QUANTITY_INVALID` para diferencia contra lo pedido, stale, tot
 
 ### Relacion con el pedido
 
-db-3 permite que varias `purchase_items` apunten al mismo `purchase_order_item_id`. Por tanto la comparacion contra lo pedido debe ser agregada y no se debe asumir relacion 1:1.
+db-4 permite que varias `purchase_items` apunten al mismo `purchase_order_item_id`. Por tanto la comparacion contra lo pedido debe ser agregada y no se debe asumir relacion 1:1.
 
 La evaluacion debe partir del conjunto completo de `purchase_order_items` del pedido origen, no solamente de las `purchase_items` existentes. Para cada `purchase_order_item`:
 
@@ -566,7 +601,7 @@ total_received_base =
 ordered_base = purchase_order_items.ordered_qty_base
 ```
 
-Si no existe ninguna `purchase_item` asociada a un `purchase_order_item`, el recibido agregado es `0`. Ese `purchase_order_item` no se omite del futuro procesamiento de `CONFIRM_PURCHASE`: se considera `received_base = 0` y posteriormente sus reservations deberan resolverse segun las reglas de fulfillment/release que todavia se disenaran.
+Si no existe ninguna `purchase_item` asociada a un `purchase_order_item`, el recibido agregado es `0`. Ese `purchase_order_item` no se omite del procesamiento de `CONFIRM_PURCHASE`: se considera `received_base = 0` y sus reservations se resuelven con `safe_fulfill_now = 0` y la futura regla de release.
 
 Si `total_received_base = ordered_base`, no existe diferencia cuantitativa agregada. Si `total_received_base < ordered_base`, existe faltante. Si `total_received_base > ordered_base`, existe excedente respecto de lo pedido. Esto no modifica Politica A de reposicion.
 
@@ -598,7 +633,7 @@ No significa automaticamente:
 fulfilled_qty_base = received_applicable_to_replenishment_base
 ```
 
-El fulfillment real queda pendiente y debera limitarse posteriormente por reservations preexistentes, demanda realmente pendiente, reglas por `sale_item`, devoluciones `RETURN_RESTOCK` posteriores al pedido y la futura regla de release.
+El fulfillment agregado real se determina en este contrato con `safe_fulfill_now`, limitado por reservations preexistentes, demanda realmente pendiente, reglas por `sale_item` y devoluciones `RETURN_RESTOCK` posteriores al pedido. La regla definitiva de release sigue pendiente.
 
 La regla no modifica retrospectivamente `purchase_order_items.replenishment_qty_base`, `customer_special_qty_base`, `stock_extra_qty_base` ni `ordered_qty_base`. Tampoco reclasifica `stock_extra` o `customer_special` como replenishment; ambos son motivos non-replenishment para este calculo.
 
@@ -611,13 +646,13 @@ Ejemplos:
 
 Si `total_received_base = 0`, entonces `received_applicable_to_replenishment_base = 0`. Una `purchase_item` con `purchase_order_item_id IS NULL` no participa en esta formula y conserva la politica de producto no pedido: no crea allocation, no genera fulfillment, no crea `ORDER_RESERVE` y no cubre demanda nueva.
 
-Si una devolucion posterior al pedido redujo la demanda real, esta regla no obliga a fulfillar todo lo recibido aplicable. Ejemplo: `replenishment historico = 5` y `received = 5` establecen `received_applicable_to_replenishment_base = 5`; si por `RETURN_RESTOCK` posterior solo queda demanda real `3`, el futuro bloque de demand-cap podra determinar `fulfilled <= 3` y resolver la parte no fulfillable segun la futura regla de release.
+Si una devolucion posterior al pedido redujo la demanda real, esta regla no obliga a fulfillar todo lo recibido aplicable. Ejemplo: `replenishment historico = 5` y `received = 5` establecen `received_applicable_to_replenishment_base = 5`; si por `RETURN_RESTOCK` posterior solo queda demanda real `3`, `safe_fulfill_now` podra determinar `fulfilled <= 3` y la parte no fulfillable se resolvera segun la futura regla de release.
 
 Politica A se mantiene completa: esta regla no autoriza crear allocations, ampliar reservations, cubrir demanda nueva, reasignar exceso ni buscar otro `sale_item` FIFO nuevo.
 
-Esta regla es funcional/transaccional y no requiere columna, constraint, trigger, indice, tabla ni db-4.
+Esta regla es funcional/transaccional. db-4 ya aporta el detail necesario para descomponer el fulfillment resultante, pero no requiere mas columnas, constraints, triggers, indices ni tablas.
 
-Si `purchase_order_item_id IS NOT NULL`, `product_id` debe corresponder al producto de esa linea del pedido. db-3 lo protege mediante FK compuesta. Un producto equivocado no se representa apuntando la nueva mercancia al `order_item` original; debe representarse como linea original con recibido cero o faltante y nueva `purchase_item` con `purchase_order_item_id = NULL`.
+Si `purchase_order_item_id IS NOT NULL`, `product_id` debe corresponder al producto de esa linea del pedido. db-4 lo protege mediante FK compuesta. Un producto equivocado no se representa apuntando la nueva mercancia al `order_item` original; debe representarse como linea original con recibido cero o faltante y nueva `purchase_item` con `purchase_order_item_id = NULL`.
 
 No es obligatorio que `purchase_item.product_unit_id = purchase_order_item.product_unit_id`. Puede recibirse el mismo producto en una presentacion distinta. Lo obligatorio es mismo `product_id`, `product_unit` perteneciente al producto, `factor_to_base_snapshot` valido y `received_qty_base` coherente. No modificar el pedido historico.
 
@@ -643,7 +678,7 @@ Orden historico total para determinar precedencia entre reservations preexistent
 4. `purchase_order_items.id ASC`.
 5. `replenishment_allocations.id ASC`.
 
-Este orden se usa solamente para determinar precedencia entre reservations preexistentes. No cierra todavia la distribucion exacta de `purchase_items` hacia allocations ni la semantica final de `replenishment_allocations.purchase_item_id`.
+Este orden se usa para determinar precedencia entre reservations preexistentes. Es independiente del orden usado despues para consumir `purchase_items` fisicas como sources de fulfillment.
 
 Para cada `sale_item`, definir:
 
@@ -743,7 +778,7 @@ receipt_cap =
   )
 ```
 
-`remaining_received_applicable_for_allocation` proviene del pool `received_applicable_to_replenishment_base` del `purchase_order_item`, consumido en orden interno determinista. Este micro-hito no cierra todavia la trazabilidad exacta de `purchase_item_id`.
+`remaining_received_applicable_for_allocation` proviene del pool `received_applicable_to_replenishment_base` del `purchase_order_item`, consumido en orden interno determinista. La trazabilidad exacta por `purchase_item` se materializa despues en `replenishment_allocation_fulfillments`.
 
 Definir:
 
@@ -850,7 +885,7 @@ Si varias allocations del mismo `purchase_order` apuntan al mismo `sale_item`, n
 2. `purchase_order_items.id ASC`.
 3. `replenishment_allocations.id ASC`.
 
-Despues de resolver conceptualmente una allocation anterior de la misma compra, sus efectos forman parte de `fulfilled_prior` y del remanente de mercancia aplicable antes de evaluar la siguiente. Este punto no documenta todavia el `purchase_item_id` exacto.
+Despues de resolver conceptualmente una allocation anterior de la misma compra, sus efectos forman parte de `fulfilled_prior` y del remanente de mercancia aplicable antes de evaluar la siguiente. El detail exacto por `purchase_item` se inserta en la misma FASE B y misma transaccion que actualiza la allocation.
 
 Si una allocation historica anterior cumple:
 
@@ -875,7 +910,226 @@ Ejemplos breves:
 - RESTOCK 2 y B recibe solo 1: `receipt_cap = 1`, `safe = 1`, `max_future = 1`. Resultado: SAFE; puede resolver `fulfilled 1` y `released 3` aunque A siga activa.
 - Current demand 0 y B recibe 4: `safe = 0`, `max_future = 0`. Resultado: SAFE; B puede terminar `fulfilled 0` y `released 4`.
 
-El calculo futuro requerira estado consistente de:
+### Fulfillment db-4 y detail autoritativo
+
+`CONFIRM_PURCHASE` no persiste fulfillment allocation por allocation mientras todavia esta comprobando si toda la compra es SAFE. Primero existe una fase de planificacion dentro de FASE B, con variables conceptuales/provisionales en memoria o equivalente transaccional, todavia sin `UPDATE` ni `INSERT` de efectos de fulfillment/detail.
+
+Primero recorrer `purchase_order_items` del pedido actual por:
+
+1. `purchase_order_items.line_number ASC`.
+2. `purchase_order_items.id ASC`.
+
+Dentro de cada `purchase_order_item`, las `replenishment_allocations` destino se procesan segun el FIFO historico de demanda heredado de `CONFIRM_ORDER`:
+
+1. `sales.confirmed_at ASC`.
+2. `sales.id ASC`.
+3. `sale_items.line_number ASC`.
+4. `sale_items.id ASC`.
+5. `replenishment_allocations.id ASC` como desempate defensivo.
+
+Este es el orden DESTINO dentro del `purchase_order_item`. Es distinto del source FIFO de `purchase_items` y no reemplaza el orden de precedencia externa usado por SAFE EARLY RESOLUTION.
+
+Si varias allocations del mismo `purchase_order` apuntan al mismo `sale_item`, se conserva la precedencia interna ya definida por `purchase_order_items.line_number ASC`, `purchase_order_items.id ASC`, `replenishment_allocations.id ASC`. No reemplazar esta regla por un sort global basado unicamente en `sales`.
+
+Para cada `purchase_order_item`, iniciar el pool destino provisional:
+
+```text
+planned_remaining_received_applicable =
+  received_applicable_to_replenishment_base
+```
+
+Las allocations destino se recorren en el orden anterior. Para cada allocation, calcular `current_sale_item_demand` incluyendo los `planned_fulfill_delta` ya planificados de allocations anteriores de esta misma operacion cuando correspondan. Esos deltas planificados forman parte del `fulfilled_prior` conceptual para evaluar allocations posteriores, aunque todavia no se hayan persistido.
+
+Despues calcular `remaining_reserved`, `external_prior_active_reserved` y `allocation_demand_entitlement_now` segun las formulas SAFE ya definidas.
+
+Para cada allocation:
+
+```text
+receipt_cap =
+  MIN(
+    planned_remaining_received_applicable,
+    remaining_reserved
+  )
+```
+
+Esta es la misma variable `receipt_cap` usada por SAFE EARLY RESOLUTION, ahora cerrada contra el pool destino provisional del `purchase_order_item`. Despues calcular `max_future_fulfill` y `safe_fulfill_now` sin cambiar sus formulas.
+
+Si:
+
+```text
+safe_fulfill_now < max_future_fulfill
+```
+
+entonces producir `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` y abortar toda FASE B sin persistir ningun fulfillment/detail.
+
+Para cada allocation SAFE, el incremento agregado de fulfillment queda cerrado como:
+
+```text
+planned_fulfill_delta = safe_fulfill_now
+```
+
+Despues de calcular `planned_fulfill_delta`, actualizar solo el plan provisional:
+
+```text
+planned_remaining_received_applicable =
+  planned_remaining_received_applicable
+  - planned_fulfill_delta
+```
+
+`planned_remaining_received_applicable` nunca puede ser negativo. Si llega a `0`, las allocations posteriores reciben `receipt_cap = 0`. La cantidad no consumida por fulfillment no se reasigna a demanda nueva. Policy A continua vigente.
+
+No hacer todavia `UPDATE` de `replenishment_allocations`. No insertar detail todavia.
+
+Solo cuando todas las allocations relevantes de toda la compra hayan sido planificadas y ninguna produzca `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, el plan puede materializarse dentro de la misma FASE B y misma transaccion.
+
+Al materializar, cada `planned_fulfill_delta` incrementa `replenishment_allocations.fulfilled_qty_base`; no lo reemplaza:
+
+```text
+new_allocation_fulfilled_qty_base =
+  old_allocation_fulfilled_qty_base
+  + planned_fulfill_delta
+```
+
+Esta forma incremental sigue siendo correcta ante un estado defensivo parcialmente resuelto. La formula definitiva de `released_qty_base` queda pendiente para `ORDER_RELEASE`; este micro-hito no la congela.
+
+La descomposicion cuantitativa autoritativa de ese `planned_fulfill_delta` se inserta en `replenishment_allocation_fulfillments`:
+
+```text
+purchase_item -> fulfilled_qty_base -> replenishment_allocation
+```
+
+`replenishment_allocations.fulfilled_qty_base` sigue siendo el estado agregado autoritativo de la allocation. `replenishment_allocation_fulfillments` es el detail historico que explica de que `purchase_items` provino esa cantidad.
+
+Para el detail creado por esta confirmacion:
+
+```text
+SUM(new detail rows para la allocation)
+= planned_fulfill_delta
+```
+
+Despues de la actualizacion, la invariante transaccional obligatoria por allocation es:
+
+```text
+SUM(all historical detail rows para la allocation)
+= new_allocation_fulfilled_qty_base
+```
+
+Esta igualdad no esta forzada por CHECK/FK en db-4. Debe mantenerse en el servicio dentro de la misma FASE B y misma transaccion, y esta respaldada por `database/validation-v0.5-db-4.sql`. Si existe fulfilled historico sin detail compatible con db-4, no hacer auto-repair ni backfill silencioso.
+
+Reglas del detail:
+
+- Si `planned_fulfill_delta = 0`, no insertar rows en `replenishment_allocation_fulfillments` para esa allocation.
+- Todo detail row debe tener `fulfilled_qty_base > 0`.
+- La pareja `replenishment_allocation_id + purchase_item_id` es unica.
+- Allocation y `purchase_item` deben pertenecer al mismo `purchase_order_item`, garantizado fisicamente por las FKs compuestas de db-4.
+- Una `purchase_item` con `purchase_order_item_id IS NULL` no participa en fulfillment de reposicion ni detail.
+- Una `purchase_item` puede aportar a varias allocations.
+- Una allocation puede recibir fulfillment desde varias `purchase_items`.
+
+Source FIFO de `purchase_items` dentro del mismo `purchase_order_item`:
+
+1. `purchase_items.line_number ASC`.
+2. `purchase_items.id ASC`.
+
+Este source FIFO consume solo el pool `received_applicable_to_replenishment_base` del `purchase_order_item`. No convierte excedentes `stock_extra` o `customer_special` en reposicion y no busca `purchase_items` de otro `purchase_order_item`.
+
+Solo despues de que toda la compra tenga plan SAFE, construir capacidades source REPLENISHMENT-FIRST para cada `purchase_order_item`:
+
+```text
+remaining_source_pool =
+  received_applicable_to_replenishment_base
+```
+
+Recorrer `purchase_items` asociadas en source FIFO. Para cada source:
+
+```text
+source_replenishment_capacity =
+  MIN(
+    purchase_item.received_qty_base,
+    remaining_source_pool
+  )
+
+remaining_source_pool =
+  remaining_source_pool
+  - source_replenishment_capacity
+```
+
+Cuando `remaining_source_pool = 0`, sources posteriores tienen capacidad replenishment `0`. Debe cumplirse:
+
+```text
+SUM(source_replenishment_capacity)
+= received_applicable_to_replenishment_base
+```
+
+Esto tambien se cumple cuando el valor es `0`, porque `received_applicable_to_replenishment_base = MIN(total_received_base, replenishment_qty_base)` y las capacidades source se construyen sobre las `purchase_items` cuyo `SUM(received_qty_base)` forma `total_received_base`.
+
+Estas capacidades se consumen acumulativamente al recorrer allocations destino. No reiniciar la capacidad de una `purchase_item` para cada allocation.
+
+Para cada allocation destino con `planned_fulfill_delta > 0`:
+
+```text
+allocation_remaining_to_source = planned_fulfill_delta
+```
+
+Recorrer sources con capacidad restante en source FIFO. Para cada source:
+
+```text
+detail_delta =
+  MIN(
+    allocation_remaining_to_source,
+    source_capacity_remaining
+  )
+```
+
+Si `detail_delta > 0`, crear/consolidar conceptualmente:
+
+```text
+replenishment_allocation_fulfillments(
+  replenishment_allocation_id,
+  purchase_item_id,
+  purchase_order_item_id,
+  fulfilled_qty_base = detail_delta
+)
+```
+
+Despues:
+
+```text
+allocation_remaining_to_source =
+  allocation_remaining_to_source - detail_delta
+
+source_capacity_remaining =
+  source_capacity_remaining - detail_delta
+```
+
+Continuar hasta `allocation_remaining_to_source = 0`. Debe ser error interno de planificacion si no existen sources suficientes para explicar un `planned_fulfill_delta` previamente calculado. No crear nuevo error publico todavia.
+
+Ejemplo many-to-many:
+
+- Allocations destino: `A fulfill_delta = 3`, `B fulfill_delta = 4`, `C fulfill_delta = 3`.
+- Sources elegibles: `P1 capacity = 5`, `P2 capacity = 5`.
+- Resultado: `A-P1 = 3`, `B-P1 = 2`, `B-P2 = 2`, `C-P2 = 3`.
+- Validacion: `A detail total = 3`, `B detail total = 4`, `C detail total = 3`, `P1 consumed = 5`, `P2 consumed = 5`.
+
+Este ejemplo muestra que una source cubre multiples allocations y una allocation puede consumir multiples sources.
+
+Ejemplo REPLENISHMENT-FIRST:
+
+- `purchase_order_item`: `replenishment_qty_base = 5`, `stock_extra_qty_base = 5`.
+- `purchase_items`: `P1 received_qty_base = 3`, `P2 received_qty_base = 7`.
+- `total_received_base = 10`.
+- `received_applicable_to_replenishment_base = MIN(10, 5) = 5`.
+- Source capacities: `P1 = 3`, `P2 = 2`.
+
+Las 5 unidades restantes de `P2` siguen siendo recepcion fisica, no tienen source capacity de replenishment, no aparecen en detail, no crean allocations y no cubren demanda nueva. Inventory effects siguen pendientes.
+
+Durante la materializacion del plan, la operacion debe actualizar `replenishment_allocations.fulfilled_qty_base` e insertar sus `replenishment_allocation_fulfillments` en la misma FASE B y misma transaccion. Si falla cualquiera de las dos escrituras, se hace rollback completo.
+
+Replay/recovery no debe reinsertar detail. Si una confirmacion historica ya quedo completa, se reconcilia idempotencia sin repetir fulfillment ni insertar rows nuevas. Si el estado historico es inconsistente, no hacer auto-repair ni backfill silencioso de `replenishment_allocation_fulfillments`.
+
+No crear `replenishment_allocation_fulfillments` para representar release, inventario, costo promedio, movements ni positions. Esos efectos siguen teniendo contratos pendientes o separados.
+
+El calculo de SAFE EARLY RESOLUTION y del detail db-4 requiere estado consistente de:
 
 - `sale_item`;
 - `returns` / `return_items` CONFIRMED relevantes;
@@ -912,7 +1166,7 @@ Una `purchase` puede confirmarse sin `purchase_items`. No existe `PURCHASE_EMPTY
 En ese caso:
 
 - todas las `purchase_order_items` del pedido tienen `total_received_base = 0`;
-- todas las cantidades reservadas aplicables podran liberarse en el futuro flujo de fulfillment/release;
+- todas las cantidades reservadas aplicables tendran `safe_fulfill_now = 0` y podran liberarse posteriormente segun `ORDER_RELEASE`;
 - no existe `difference_reason` obligatorio;
 
 Y los totales de cabecera deben ser:
@@ -1460,13 +1714,21 @@ Queda congelado el prefijo y el bloque de validaciones del `DRAFT` antes de cual
 27. Validar relaciones de total de linea: `purchase_items.total = purchase_items.subtotal + purchase_items.tax_total`.
 28. Validar sumas/totales de header: subtotal, `tax_total`, total por suma de lineas y `total = subtotal + tax_total`; si no hay lineas, todos deben ser cero.
 29. Calcular recepcion aplicable con REPLENISHMENT-FIRST: `received_applicable_to_replenishment_base` por `purchase_order_item`.
-30. Descubrir reservations preexistentes del `purchase_order` origen y del mismo `sale_item` necesarias para evaluar precedencia historica.
-31. Ordenar precedence entre reservations por `purchase_orders.confirmed_at ASC`, `purchase_orders.id ASC`, `purchase_order_items.line_number ASC`, `purchase_order_items.id ASC`, `replenishment_allocations.id ASC`.
-32. Para cada allocation relevante, calcular `current_sale_item_demand`, `external_prior_active_reserved`, `allocation_demand_entitlement_now`, `receipt_cap`, `max_future_fulfill` y `safe_fulfill_now`.
-33. Si alguna allocation relevante produce `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, abortar FASE B sin efectos de negocio.
-34. Solo si todas las allocations relevantes son SAFE, continuar hacia bloques de fulfillment/effects todavia pendientes.
-35. Ejecutar posteriormente effects/locks de inventario/reposicion todavia pendientes.
-36. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
+30. Inicializar plan provisional por `purchase_order_item` con `planned_remaining_received_applicable = received_applicable_to_replenishment_base`.
+31. Descubrir reservations preexistentes del `purchase_order` origen y del mismo `sale_item` necesarias para SAFE.
+32. Evaluar precedence externa historica por `purchase_orders.confirmed_at ASC`, `purchase_orders.id ASC`, `purchase_order_items.line_number ASC`, `purchase_order_items.id ASC`, `replenishment_allocations.id ASC`.
+33. Recorrer `purchase_order_items` del pedido actual por `line_number ASC, id ASC`.
+34. Dentro de cada order item, recorrer allocations destino por FIFO de demanda: `sales.confirmed_at ASC`, `sales.id ASC`, `sale_items.line_number ASC`, `sale_items.id ASC`, `replenishment_allocations.id ASC`.
+35. Para cada allocation, calcular SAFE usando el pool provisional y `fulfilled_prior` que incluye `planned_fulfill_delta` anteriores de esta misma operacion cuando correspondan.
+36. Si cualquier allocation produce `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, abortar FASE B completa sin effects ni fulfillment/detail persistido.
+37. Si es SAFE, registrar `planned_fulfill_delta = safe_fulfill_now` y consumir `planned_remaining_received_applicable`; nunca puede ser negativo y, si llega a `0`, las allocations posteriores reciben `receipt_cap = 0`.
+38. Solo cuando toda la compra tenga plan SAFE, construir capacidades source REPLENISHMENT-FIRST por `purchase_order_item` recorriendo `purchase_items` en source FIFO `line_number ASC, id ASC`.
+39. Consumir source capacities acumulativamente contra allocations destino para producir `detail_delta`, sin reiniciar capacidad por allocation.
+40. Persistir, en la misma transaccion, cada `detail_delta > 0` en `replenishment_allocation_fulfillments` y el incremento de `replenishment_allocations.fulfilled_qty_base` con `old_allocation_fulfilled_qty_base + planned_fulfill_delta`.
+41. Verificar reconciliacion: `SUM(new detail rows)=planned_fulfill_delta` y `SUM(all historical detail rows)=new_allocation_fulfilled_qty_base`.
+42. Si `planned_fulfill_delta = 0`, no insertar detail rows para esa allocation.
+43. Continuar hacia `PURCHASE_FULFILL`, `ORDER_RELEASE`, inventario y effects/locks todavia pendientes fuera del detail db-4.
+44. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
 
 No se introducen todavia locks de inventario/reposicion. No se producen efectos antes de completar todas las validaciones cerradas del `DRAFT` y antes de superar la evaluacion SAFE EARLY RESOLUTION.
 
@@ -1628,7 +1890,7 @@ Para `CONFIRM_PURCHASE`:
 - no reemplaza `expected_purchase_fingerprint`;
 - si tiene valor, es inmutable a nivel de servicio.
 
-No se solicita db-4.
+No se solicita cambio fisico adicional para `client_operation_id`.
 
 ## 41. UNIQUE(purchase_order_id)
 
@@ -1644,7 +1906,18 @@ No sustituye idempotencia porque no guarda:
 
 ## 42. Cambio fisico
 
-Este micro-hito no requiere:
+El cambio fisico requerido por este micro-hito ya fue materializado y congelado en db-4:
+
+- nueva tabla `replenishment_allocation_fulfillments`;
+- eliminacion de `replenishment_allocations.purchase_item_id`;
+- eliminacion de `ck_replenishment_allocations_fulfilled_purchase`;
+- eliminacion de `ix_replenishment_allocations_purchase_item`;
+- claves candidatas y FKs compuestas necesarias para garantizar mismo `purchase_order_item` entre allocation y `purchase_item`;
+- CHECK de detail `fulfilled_qty_base > 0`;
+- UNIQUE de detail `(replenishment_allocation_id, purchase_item_id)`;
+- indice de detail por `purchase_item_id`.
+
+Este micro-hito no requiere cambio fisico adicional sobre db-4:
 
 - columna;
 - tabla;
@@ -1657,10 +1930,9 @@ Este micro-hito no requiere:
 - enum PostgreSQL;
 - `request_hash` en `purchases`;
 - `client_operation_id NOT NULL`;
-- indice obligatorio;
-- db-4.
+- indice obligatorio adicional.
 
-No agregar `CHECKs` solo porque estas reglas se validen en servicio.
+No agregar `CHECKs` adicionales solo porque estas reglas se validen en servicio.
 
 El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no evolucion fisica del modelo.
 
@@ -1670,11 +1942,6 @@ El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no
 
 Antes de congelar `CONFIRM_PURCHASE v0.1`, faltan:
 
-- semantica de `replenishment_allocations.purchase_item_id`;
-- `purchase_item_id` en allocations;
-- multiples `purchase_items` por `purchase_order_item`;
-- trazabilidad exacta `purchase_item -> allocation`;
-- distribucion final del received applicable entre allocations;
 - `PURCHASE_FULFILL` definitivo;
 - `ORDER_RELEASE` definitivo;
 - movements y positions de reposicion;
@@ -1712,4 +1979,8 @@ No quedan como pendientes en este borrador:
 - Politica A;
 - prioridad historica entre reservations de distintos `purchase_orders` sobre el mismo `sale_item`;
 - SAFE EARLY RESOLUTION;
+- db-4 como referencia fisica vigente;
+- multiples `purchase_items` por `purchase_order_item`;
+- trazabilidad exacta `purchase_item -> fulfilled_qty_base -> replenishment_allocation`;
+- distribucion de `received_applicable_to_replenishment_base` entre allocations SAFE;
 - condicion retryable `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` sin FASE C `FAILED`.
