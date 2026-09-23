@@ -621,6 +621,270 @@ Si `purchase_order_item_id IS NOT NULL`, `product_id` debe corresponder al produ
 
 No es obligatorio que `purchase_item.product_unit_id = purchase_order_item.product_unit_id`. Puede recibirse el mismo producto en una presentacion distinta. Lo obligatorio es mismo `product_id`, `product_unit` perteneciente al producto, `factor_to_base_snapshot` valido y `received_qty_base` coherente. No modificar el pedido historico.
 
+### Safe early resolution de reservations
+
+`CONFIRM_PURCHASE v0.1` cierra la regla conceptual de resolucion segura temprana para allocations de reposicion cuando existen varias reservations historicas sobre el mismo `sale_item` pertenecientes a distintos `purchase_orders`.
+
+La prioridad entre `replenishment_allocations` del mismo `sale_item` proviene de la antiguedad de la reservation creada por `CONFIRM_ORDER`.
+
+No depende de:
+
+- `purchases.confirmed_at`;
+- `purchase_items.created_at`;
+- llegada fisica;
+- actor;
+- orden accidental de ejecucion de `CONFIRM_PURCHASE`.
+
+Orden historico total para determinar precedencia entre reservations preexistentes:
+
+1. `purchase_orders.confirmed_at ASC`.
+2. `purchase_orders.id ASC`.
+3. `purchase_order_items.line_number ASC`.
+4. `purchase_order_items.id ASC`.
+5. `replenishment_allocations.id ASC`.
+
+Este orden se usa solamente para determinar precedencia entre reservations preexistentes. No cierra todavia la distribucion exacta de `purchase_items` hacia allocations ni la semantica final de `replenishment_allocations.purchase_item_id`.
+
+Para cada `sale_item`, definir:
+
+```text
+confirmed_restock_returned =
+  SUM(return_items.quantity_base)
+  de devoluciones CONFIRMED para ese sale_item
+  con disposition = RESTOCK
+```
+
+`DAMAGED` no participa porque no reduce demanda de reposicion.
+
+Definir:
+
+```text
+fulfilled_prior =
+  SUM(replenishment_allocations.fulfilled_qty_base)
+  del mismo sale_item
+  ya materializado antes de evaluar la allocation actual
+```
+
+`fulfilled_prior` debe incluir efectos anteriores de la misma transaccion cuando se procesan allocations del mismo `purchase_order` secuencialmente.
+
+Entonces:
+
+```text
+current_sale_item_demand =
+  GREATEST(
+    sale_items.quantity_base
+    - confirmed_restock_returned
+    - fulfilled_prior,
+    0
+  )
+```
+
+Las reservations activas no se restan en `current_sale_item_demand` porque todavia no representan demanda cubierta.
+
+Mantener formula defensiva para cada allocation:
+
+```text
+remaining_reserved =
+  reserved_qty_base
+  - fulfilled_qty_base
+  - released_qty_base
+```
+
+Nunca asumir el `reserved_qty_base` completo si la allocation ya tiene resolucion parcial historica.
+
+Una allocation terminal cumple:
+
+```text
+fulfilled_qty_base + released_qty_base = reserved_qty_base
+```
+
+Por tanto tiene:
+
+```text
+remaining_reserved = 0
+```
+
+Para una allocation `X`:
+
+```text
+external_prior_active_reserved =
+  SUM(remaining_reserved)
+```
+
+Solo participan allocations:
+
+- del mismo `sale_item`;
+- historicamente anteriores a `X` segun el orden total definido arriba;
+- con `remaining_reserved > 0`;
+- pertenecientes a otro `purchase_order`.
+
+Allocations anteriores del mismo `purchase_order` actual no son dependencia externa. Se procesan secuencialmente dentro de la misma FASE B y sus efectos se reflejan antes de evaluar la siguiente allocation.
+
+Definir:
+
+```text
+allocation_demand_entitlement_now =
+  GREATEST(
+    current_sale_item_demand
+    - external_prior_active_reserved,
+    0
+  )
+```
+
+Semantica: es la demanda que la allocation actual puede consumir de forma segura asumiendo conservadoramente que todos sus predecessors externos activos podrian necesitar toda su reservation restante.
+
+Partiendo de REPLENISHMENT-FIRST, para cada allocation:
+
+```text
+receipt_cap =
+  MIN(
+    remaining_received_applicable_for_allocation,
+    remaining_reserved
+  )
+```
+
+`remaining_received_applicable_for_allocation` proviene del pool `received_applicable_to_replenishment_base` del `purchase_order_item`, consumido en orden interno determinista. Este micro-hito no cierra todavia la trazabilidad exacta de `purchase_item_id`.
+
+Definir:
+
+```text
+max_future_fulfill =
+  MIN(
+    receipt_cap,
+    current_sale_item_demand
+  )
+```
+
+`max_future_fulfill` es el maximo que la allocation podria llegar a fulfill con la mercancia ya recibida por esta compra si todas las reservations externas anteriores terminaran liberandose.
+
+Una liberacion anterior:
+
+- no aumenta `current_sale_item_demand`;
+- unicamente elimina una reservation que tenia prioridad.
+
+No considerar ventas futuras.
+
+Definir:
+
+```text
+safe_fulfill_now =
+  MIN(
+    receipt_cap,
+    allocation_demand_entitlement_now
+  )
+```
+
+Una allocation puede resolverse ahora si:
+
+```text
+safe_fulfill_now = max_future_fulfill
+```
+
+La razon es que la desaparicion posterior de predecessors no podria aumentar su fulfillment posible con esta compra. En ese caso no es necesario esperar a que todos los `purchase_orders` anteriores terminen.
+
+Si:
+
+```text
+safe_fulfill_now < max_future_fulfill
+```
+
+la resolucion seria prematura. La operacion debe producir la condicion temporal:
+
+```text
+PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING
+```
+
+y abortar toda FASE B sin efectos de negocio. No terminalizar parcialmente la allocation actual solo para continuar.
+
+`PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` significa que una reservation historica anterior todavia activa puede cambiar cuanto fulfillment corresponde de forma definitiva a la purchase actual.
+
+Esta condicion es:
+
+- temporal;
+- retryable;
+- no corrupcion;
+- no stale del `DRAFT`;
+- no error fiscal;
+- no inconsistencia interna;
+- no `FAILED` terminal.
+
+`PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` no entra a FASE C como `idempotency_keys.status = 'FAILED'`. La condicion puede desaparecer despues de que el `purchase_order` predecessor termine fulfilled/released. Persistir `FAILED` haria que la misma key/hash reprodujera para siempre un resultado temporal ya obsoleto.
+
+Si FASE B detecta `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`:
+
+1. hacer rollback completo de FASE B;
+2. realizar una transaccion corta sobre `idempotency_keys`;
+3. verificar misma key/request_hash;
+4. mantener `status = 'IN_PROGRESS'`;
+5. liberar el lease actual;
+6. dejar `expires_at = NULL`;
+7. no marcar `COMPLETED`;
+8. no marcar `FAILED`.
+
+Representacion conceptual del lease liberado:
+
+```text
+locked_until <= now()
+```
+
+Puede utilizarse `locked_until = now()` o semantica equivalente de implementacion. No se disena SQL definitivo.
+
+La misma `idempotency_key` + `request_hash` puede reintentarse despues. Al llegar de nuevo, una key `IN_PROGRESS` con lease no vigente entra al flujo existente de recuperacion segura, reevalua `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` contra el estado actual y puede continuar si el predecessor ya quedo terminal.
+
+Cuando ocurra `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, no debe quedar:
+
+- inventory changes;
+- allocation updates;
+- replenishment movements;
+- `purchase CONFIRMED`;
+- `purchase_order CLOSED`;
+- audit `PURCHASE_CONFIRMED`;
+- idempotency `COMPLETED`;
+- idempotency `FAILED`.
+
+`CONFIRM_PURCHASE` sigue siendo atomica. Si una sola allocation relevante de cualquier linea determina `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, se difiere toda la compra. No se confirman algunas lineas, no se fulfillan algunas allocations, no se recibe inventario parcialmente y no se cierra parcialmente el pedido.
+
+Si varias allocations del mismo `purchase_order` apuntan al mismo `sale_item`, no se consideran predecessors externos entre si. Se procesan internamente por:
+
+1. `purchase_order_items.line_number ASC`.
+2. `purchase_order_items.id ASC`.
+3. `replenishment_allocations.id ASC`.
+
+Despues de resolver conceptualmente una allocation anterior de la misma compra, sus efectos forman parte de `fulfilled_prior` y del remanente de mercancia aplicable antes de evaluar la siguiente. Este punto no documenta todavia el `purchase_item_id` exacto.
+
+Si una allocation historica anterior cumple:
+
+```text
+fulfilled_qty_base + released_qty_base = reserved_qty_base
+```
+
+no pertenece a `external_prior_active_reserved`. Su fulfilled ya participa en `fulfilled_prior`. Su released no consume demanda.
+
+Si aparece defensivamente una allocation anterior parcialmente resuelta, solo `reserved_qty_base - fulfilled_qty_base - released_qty_base` forma parte de `external_prior_active_reserved`.
+
+`CANCEL_ORDER` no se disena aqui. La compatibilidad conceptual es: si un pedido predecessor se cancela correctamente y sus reservations quedan terminalmente released, dejan de formar parte de `external_prior_active_reserved`.
+
+No se esperan ventas futuras. Politica A sigue prohibiendo que `CONFIRM_PURCHASE` cree allocations nuevas para demanda nacida despues de `CONFIRM_ORDER`. SAFE EARLY RESOLUTION solo analiza reservations ya existentes.
+
+La evaluacion de returns usa un estado consistente de devoluciones confirmadas visible dentro de la futura barrera transaccional. La concurrencia exacta y el orden de locks siguen pendientes.
+
+Ejemplos breves:
+
+- Sin return: demand 10, A reserved 6, B reserved 4, B recibe 4 primero. Para B: `entitlement_now = 4`, `receipt_cap = 4`, `max_future = 4`, `safe = 4`. Resultado: SAFE; B puede confirmar.
+- RESTOCK 2 y B recibe 4: demand 10, current demand 8, A6 anterior, B4 actual. Para B: `entitlement_now = 2`, `receipt_cap = 4`, `max_future = 4`, `safe = 2`. Resultado: DEFER con `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`.
+- RESTOCK 2 y B recibe solo 1: `receipt_cap = 1`, `safe = 1`, `max_future = 1`. Resultado: SAFE; puede resolver `fulfilled 1` y `released 3` aunque A siga activa.
+- Current demand 0 y B recibe 4: `safe = 0`, `max_future = 0`. Resultado: SAFE; B puede terminar `fulfilled 0` y `released 4`.
+
+El calculo futuro requerira estado consistente de:
+
+- `sale_item`;
+- `returns` / `return_items` CONFIRMED relevantes;
+- `replenishment_allocations` del `sale_item`;
+- `replenishment_positions` correspondiente;
+- purchase/order actual.
+
+Este micro-hito no fija todavia el orden global de locks.
+
 ### difference_reason
 
 Si existe al menos una `purchase_item` asociada a un `purchase_order_item` y el recibido agregado difiere de `purchase_order_items.ordered_qty_base`, debe existir al menos un `difference_reason` no vacio entre las `purchase_items` asociadas a ese `purchase_order_item`. No se exige repetir el mismo motivo en todas las lineas fraccionadas.
@@ -1195,10 +1459,16 @@ Queda congelado el prefijo y el bloque de validaciones del `DRAFT` antes de cual
 26. Validar `tax_total` contra `tax_snapshot` v1.
 27. Validar relaciones de total de linea: `purchase_items.total = purchase_items.subtotal + purchase_items.tax_total`.
 28. Validar sumas/totales de header: subtotal, `tax_total`, total por suma de lineas y `total = subtotal + tax_total`; si no hay lineas, todos deben ser cero.
-29. Ejecutar posteriormente effects/locks de inventario/reposicion todavia pendientes.
-30. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
+29. Calcular recepcion aplicable con REPLENISHMENT-FIRST: `received_applicable_to_replenishment_base` por `purchase_order_item`.
+30. Descubrir reservations preexistentes del `purchase_order` origen y del mismo `sale_item` necesarias para evaluar precedencia historica.
+31. Ordenar precedence entre reservations por `purchase_orders.confirmed_at ASC`, `purchase_orders.id ASC`, `purchase_order_items.line_number ASC`, `purchase_order_items.id ASC`, `replenishment_allocations.id ASC`.
+32. Para cada allocation relevante, calcular `current_sale_item_demand`, `external_prior_active_reserved`, `allocation_demand_entitlement_now`, `receipt_cap`, `max_future_fulfill` y `safe_fulfill_now`.
+33. Si alguna allocation relevante produce `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, abortar FASE B sin efectos de negocio.
+34. Solo si todas las allocations relevantes son SAFE, continuar hacia bloques de fulfillment/effects todavia pendientes.
+35. Ejecutar posteriormente effects/locks de inventario/reposicion todavia pendientes.
+36. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
 
-No se introducen todavia locks de inventario/reposicion. No se producen efectos antes de completar todas las validaciones cerradas del `DRAFT`.
+No se introducen todavia locks de inventario/reposicion. No se producen efectos antes de completar todas las validaciones cerradas del `DRAFT` y antes de superar la evaluacion SAFE EARLY RESOLUTION.
 
 La consistencia supplier/product business puede validarse antes del fingerprint porque protege tenant/integridad. La semantica fiscal completa de `tax_snapshot` v1 queda definida por `docs/domain/tax-snapshot-v1.md` y se valida antes de efectos.
 
@@ -1291,6 +1561,21 @@ No se agregan a FASE C en este micro-hito:
 - `PRODUCT_INACTIVE`;
 - `PRODUCT_UNIT_INVALID`.
 
+`PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` se agrega al catalogo conceptual de resultados/condiciones de `CONFIRM_PURCHASE`, pero no pertenece a la lista de errores deterministicos persistidos como `FAILED` en FASE C. Es una condicion temporal y retryable sobre la misma key/hash.
+
+Tratamiento especifico de `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`:
+
+1. `ROLLBACK` completo de FASE B.
+2. Transaccion corta sobre `idempotency_keys`.
+3. Verificar misma `idempotency_key` y mismo `request_hash`.
+4. Mantener `status = 'IN_PROGRESS'`.
+5. Liberar el lease actual con `locked_until <= now()`; `locked_until = now()` es una representacion conceptual valida.
+6. Mantener `expires_at = NULL`.
+7. No marcar `COMPLETED`.
+8. No marcar `FAILED`.
+
+Un retry posterior de la misma key/hash entra al flujo de recuperacion segura de `IN_PROGRESS` con lease no vigente y reevalua la condicion contra el estado actual.
+
 `PURCHASE_IDEMPOTENCY_KEY_REUSED` y `PURCHASE_IDEMPOTENCY_IN_PROGRESS` pertenecen al contrato de la key y no son errores operativos de FASE B.
 
 Tampoco pasan por FASE C:
@@ -1362,11 +1647,14 @@ No sustituye idempotencia porque no guarda:
 Este micro-hito no requiere:
 
 - columna;
+- tabla;
+- status nuevo;
 - FK;
 - version;
 - trigger;
 - constraint;
 - enum;
+- enum PostgreSQL;
 - `request_hash` en `purchases`;
 - `client_operation_id NOT NULL`;
 - indice obligatorio;
@@ -1376,18 +1664,21 @@ No agregar `CHECKs` solo porque estas reglas se validen en servicio.
 
 El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no evolucion fisica del modelo.
 
+`PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` es una condicion de servicio, no un nuevo status fisico.
+
 ## 43. Puntos pendientes antes del freeze
 
 Antes de congelar `CONFIRM_PURCHASE v0.1`, faltan:
 
-- fulfillment/release;
-- demand cap por `sale_item`;
-- `RETURN_RESTOCK` posterior al pedido;
-- multiples purchase_orders sobre el mismo `sale_item`;
-- orden de resolucion de allocations;
+- semantica de `replenishment_allocations.purchase_item_id`;
 - `purchase_item_id` en allocations;
 - multiples `purchase_items` por `purchase_order_item`;
+- trazabilidad exacta `purchase_item -> allocation`;
+- distribucion final del received applicable entre allocations;
+- `PURCHASE_FULFILL` definitivo;
+- `ORDER_RELEASE` definitivo;
 - movements y positions de reposicion;
+- `replenishment_positions` updates definitivos;
 - inventory effects;
 - costo promedio;
 - orden global de locks;
@@ -1418,4 +1709,7 @@ No quedan como pendientes en este borrador:
 - folio de confirmacion;
 - parent mutex;
 - inmutabilidad purchase/order;
-- Politica A.
+- Politica A;
+- prioridad historica entre reservations de distintos `purchase_orders` sobre el mismo `sale_item`;
+- SAFE EARLY RESOLUTION;
+- condicion retryable `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` sin FASE C `FAILED`.
