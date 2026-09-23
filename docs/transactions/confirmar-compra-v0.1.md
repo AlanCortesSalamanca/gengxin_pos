@@ -66,6 +66,10 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 - `balance_after_base` para `PURCHASE_RECEIPT`;
 - reconciliacion de inventario;
 - `PURCHASE_INVENTORY_INCONSISTENT`;
+- isolation level `READ COMMITTED` + locks explicitos;
+- orden global definitivo de locks;
+- discovery vs authoritative reread/recompute;
+- concurrencia con `CONFIRM_SALE`, `CONFIRM_RETURN`, `CONFIRM_ORDER` y otras `CONFIRM_PURCHASE`;
 - errores de validacion del `DRAFT` cerrados hasta este micro-hito;
 - estados base;
 - recuperacion historica;
@@ -73,8 +77,6 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 
 Este borrador todavia deja abiertos:
 
-- orden global final de locks;
-- isolation final;
 - audit payload;
 - atomicidad global definitiva.
 
@@ -259,7 +261,7 @@ Orden canonico decidido entre parents:
 purchase_orders(id) -> purchases(id)
 ```
 
-Este documento no define todavia locks posteriores globales de inventario, costo o reposicion.
+El orden global posterior de inventario, reposicion y allocations queda cerrado mas adelante en la seccion de lock order de este mismo contrato.
 
 ## 9. Pre-read necesario
 
@@ -310,12 +312,14 @@ Aunque esas columnas sean funcionalmente inmutables, esta defensa runtime es obl
 
 ## 11. purchase_items
 
-Despues de los parent locks, bloquear/leer las `purchase_items` existentes en orden determinista:
+Despues de los parent locks, leer autoritativamente las `purchase_items` existentes bajo `purchases(id) FOR UPDATE`, sin row lock propio adicional, en orden determinista:
 
 1. `line_number ASC`;
 2. `id ASC`.
 
 Las lineas persistidas son la autoridad.
+
+Para `CONFIRM_PURCHASE`, la proteccion real contra edicion concurrente e `INSERT` phantom de lineas es el mutex del parent `purchases(id) FOR UPDATE`. Un `SELECT ... FOR UPDATE` sobre las lineas existentes no impediria, por si solo bajo `READ COMMITTED`, que otro flujo insertara una linea nueva si no respetara el mutex del parent. Por contrato, toda edicion futura del `DRAFT` debe adquirir primero ese parent lock.
 
 `CONFIRM_PURCHASE` no reconstruye el `DRAFT` desde lineas reenviadas por el cliente.
 
@@ -333,7 +337,7 @@ Significado:
 confirma exactamente la version semantica del purchase DRAFT que el usuario reviso
 ```
 
-Despues de bloquear parents + `purchase_items`:
+Despues de bloquear parents y releer autoritativamente `purchase_items` bajo el mutex de `purchases(id)`:
 
 1. recalcular fingerprint autoritativo;
 2. comparar contra `expected_purchase_fingerprint`;
@@ -909,7 +913,7 @@ Si aparece defensivamente una allocation anterior parcialmente resuelta, solo `r
 
 No se esperan ventas futuras. Politica A sigue prohibiendo que `CONFIRM_PURCHASE` cree allocations nuevas para demanda nacida despues de `CONFIRM_ORDER`. SAFE EARLY RESOLUTION solo analiza reservations ya existentes.
 
-La evaluacion de returns usa un estado consistente de devoluciones confirmadas visible dentro de la futura barrera transaccional. La concurrencia exacta y el orden de locks siguen pendientes.
+La evaluacion de returns usa un estado consistente de devoluciones confirmadas visible dentro de la barrera transaccional definida en el orden global de locks de este contrato. El calculo SAFE definitivo no puede depender de lecturas de discovery previas a esos locks.
 
 Ejemplos breves:
 
@@ -1129,7 +1133,7 @@ Ejemplo REPLENISHMENT-FIRST:
 - `received_applicable_to_replenishment_base = MIN(10, 5) = 5`.
 - Source capacities: `P1 = 3`, `P2 = 2`.
 
-Las 5 unidades restantes de `P2` siguen siendo recepcion fisica, no tienen source capacity de replenishment, no aparecen en detail, no crean allocations y no cubren demanda nueva. Inventory effects siguen pendientes.
+Las 5 unidades restantes de `P2` siguen siendo recepcion fisica, no tienen source capacity de replenishment, no aparecen en detail, no crean allocations y no cubren demanda nueva. Sus efectos de inventario se materializan por el bloque de `PURCHASE_RECEIPT` y weighted average cost.
 
 Durante la materializacion del plan, la operacion debe actualizar `replenishment_allocations.fulfilled_qty_base` e insertar sus `replenishment_allocation_fulfillments` en la misma FASE B y misma transaccion. Si falla cualquiera de las dos escrituras, se hace rollback completo.
 
@@ -1145,7 +1149,7 @@ El calculo de SAFE EARLY RESOLUTION y del detail db-4 requiere estado consistent
 - `replenishment_positions` correspondiente;
 - purchase/order actual.
 
-Este micro-hito no fija todavia el orden global de locks.
+El orden global de locks queda definido en la seccion de lock order de este contrato. El detail db-4 se planifica y materializa solo despues de adquirir esos locks y de hacer authoritative reread/recompute.
 
 ### PURCHASE_FULFILL, ORDER_RELEASE y positions de reposicion
 
@@ -1708,7 +1712,7 @@ Dentro de la misma FASE B deben quedar juntos:
 
 Si falla cualquiera, `ROLLBACK` completo de FASE B. Este micro-hito no cierra todavia el `COMMIT` global final.
 
-Los efectos de inventory y replenishment conviven en la misma FASE B. Antes de las mutaciones deberan estar adquiridos todos los locks necesarios segun el contrato global que se cerrara despues. Este documento cierra semantica de efectos, no el orden final de locks.
+Los efectos de inventory y replenishment conviven en la misma FASE B. Antes de las mutaciones deben estar adquiridos todos los locks necesarios segun el orden global cerrado en este contrato. Este documento cierra tambien el isolation level y la barrera de reread/recompute autoritativo previa a la materializacion.
 
 ### Replay y recovery de inventario
 
@@ -1723,7 +1727,7 @@ Replay `COMPLETED` o reconciliacion historica exitosa:
 
 No crear nueva identidad fisica para deduplicar movements en este micro-hito. La proteccion primaria sigue dependiendo del contrato idempotente y la atomicidad de `CONFIRM_PURCHASE`.
 
-### Concurrencia de inventario: recursos, no orden global
+### Concurrencia de inventario y orden global
 
 Este bloque requiere proteger `inventory_balances(branch_id, product_id)` para todos los productos positivos de la purchase.
 
@@ -1735,19 +1739,7 @@ Riesgos que deben impedirse:
 - ledger creado sin balance correspondiente;
 - balance actualizado sin ledger correspondiente.
 
-`product_id` queda como candidato de orden estable dentro de una sucursal.
-
-No se congela todavia el orden global respecto de:
-
-- `purchase`;
-- `purchase_items`;
-- `sale_items`;
-- `replenishment_positions`;
-- `replenishment_allocations`;
-- `inventory_balances`;
-- `audit`.
-
-Ese sera otro micro-hito.
+`product_id` queda como orden estable dentro de una sucursal. El orden global queda cerrado en este contrato: `sale_items` se adquiere antes de `inventory_balances`, e `inventory_balances` antes de `replenishment_positions`.
 
 ### Casos minimos de inventario
 
@@ -1808,7 +1800,386 @@ Caso F: `purchase_order_item_id IS NULL` y `received_qty_base > 0` entra complet
 
 Caso G: `replenishment = 5`, `stock_extra = 5`, `received = 10`; inventario aumenta `10` y replenishment fulfillment conserva su cap independiente.
 
-Caso H: dos compras concurrentes del mismo `branch/product` deben impedir lost updates de cantidad y costo promedio mediante proteccion de `inventory_balances`; el orden global de locks sigue pendiente.
+Caso H: dos compras concurrentes del mismo `branch/product` impiden lost updates de cantidad y costo promedio mediante `inventory_balances FOR UPDATE`, adquirido en el orden global definitivo.
+
+### Nivel de aislamiento y orden global de locks
+
+Decision definitiva para `CONFIRM_PURCHASE v0.1`:
+
+```text
+READ COMMITTED + locks explicitos + mutexes de agregado
+```
+
+No usar `SERIALIZABLE` por prudencia generica. `READ COMMITTED` es suficiente solo porque las lecturas criticas no se consideran autoritativas hasta despues de adquirir los locks correspondientes y releer/recalcular el estado sensible.
+
+Defensas concretas:
+
+- `purchases(id) FOR UPDATE` como mutex del agregado `purchase + purchase_items`.
+- `purchase_orders(id) FOR UPDATE` como mutex del pedido y sus lineas contractuales.
+- `sale_items` antes de inventory/replenishment.
+- `inventory_balances FOR UPDATE`.
+- `replenishment_positions FOR UPDATE`.
+- `replenishment_allocations FOR UPDATE`.
+- authoritative reread/recompute despues de locks.
+
+Orden global definitivo:
+
+1. `idempotency_keys` de `CONFIRM_PURCHASE` `FOR UPDATE`.
+2. `purchase_orders(id) FOR UPDATE`.
+3. `purchases(id) FOR UPDATE`.
+4. `purchase_order_items`: simple `SELECT` autoritativo bajo `purchase_orders(id) FOR UPDATE`, en orden `line_number ASC, id ASC`.
+5. `purchase_items`: simple `SELECT` autoritativo bajo `purchases(id) FOR UPDATE`, en orden `line_number ASC, id ASC`.
+6. `sale_items` unicos relevantes `FOR KEY SHARE ORDER BY sale_items.id ASC`.
+7. `inventory_balances`: asegurar filas inexistentes solo para productos con `received_qty_base > 0`; despues bloquear/releer todas las filas afectadas `FOR UPDATE ORDER BY product_id ASC`.
+8. `replenishment_positions` existentes `FOR UPDATE ORDER BY product_id ASC, channel ASC`.
+9. `replenishment_allocations` que esta compra va a terminalizar/modificar `FOR UPDATE ORDER BY purchase_order_item_id ASC, sale_item_id ASC, id ASC`.
+10. Authoritative reread/recompute.
+11. Materializacion de efectos ya cerrados de inventory y replenishment.
+
+No incluir `document_sequences`: `CONFIRM_PURCHASE` no reserva un nuevo folio `COM` en esta operacion.
+
+No introducir advisory lock nuevo para `CONFIRM_PURCHASE`; el contrato actual no lo requiere.
+
+#### Modo exacto de purchase_order_items
+
+Despues de `purchase_orders(id) FOR UPDATE`, `CONFIRM_PURCHASE` no necesita `FOR UPDATE`, `FOR SHARE` ni `FOR KEY SHARE` sobre cada `purchase_order_items`.
+
+Debe hacer simple `SELECT` autoritativo en orden:
+
+1. `line_number ASC`.
+2. `id ASC`.
+
+`purchase_orders(id) FOR UPDATE` protege:
+
+- estado `CONFIRMED`;
+- cierre/cancelacion incompatible;
+- estabilidad contractual de `purchase_order_items`;
+- posterior transicion `CLOSED`.
+
+Todo flujo legitimo que pretenda modificar el agregado del pedido debe pasar primero por `purchase_orders(id) FOR UPDATE`. Ademas, el pedido ya esta `CONFIRMED` y sus lineas no deben editarse. Un row lock adicional sobre las lineas no agrega una proteccion concreta para `CONFIRM_PURCHASE`.
+
+#### Modo exacto de purchase_items
+
+Despues de `purchases(id) FOR UPDATE`, `CONFIRM_PURCHASE` no necesita `FOR UPDATE`, `FOR SHARE` ni `FOR KEY SHARE` sobre cada `purchase_items`.
+
+Debe hacer simple `SELECT` autoritativo en orden:
+
+1. `line_number ASC`.
+2. `id ASC`.
+
+`purchases(id) FOR UPDATE` es el mutex obligatorio del agregado `purchase + purchase_items`. Toda edicion futura del `DRAFT` debe adquirir ese parent lock primero. Esto es lo que previene phantoms de `purchase_items` bajo `READ COMMITTED`; `SELECT ... FOR UPDATE` sobre lineas existentes no impediria un `INSERT` concurrente de una linea nueva si el escritor no respetara el parent mutex.
+
+#### sale_items: orden fisico vs FIFO funcional
+
+Orden fisico de row locks:
+
+1. deduplicar todos los `sale_item_id` relevantes;
+2. adquirir `sale_items FOR KEY SHARE ORDER BY sale_items.id ASC`.
+
+Este orden fisico es obligatorio para compatibilidad con `CONFIRM_RETURN`, que bloquea sus `sale_items` en `id ASC` con lock incompatible. Evita el ciclo intra-tabla:
+
+```text
+PURCHASE: sale_item A -> sale_item B
+RETURN:   sale_item B -> sale_item A
+```
+
+El orden fisico de row locks no cambia el orden funcional SAFE/FIFO.
+
+Orden funcional SAFE conservado, segun el tramo aplicable:
+
+1. `purchase_order_items.line_number ASC`.
+2. `purchase_order_items.id ASC`.
+3. `sales.confirmed_at ASC`.
+4. `sales.id ASC`.
+5. `sale_items.line_number ASC`.
+6. `sale_items.id ASC`.
+7. `replenishment_allocations.id ASC`.
+
+No reescribir la semantica SAFE por el orden fisico de lock.
+
+#### inventory_balances existentes
+
+Por cada producto positivo, bloquear:
+
+```text
+inventory_balances(branch_id, product_id) FOR UPDATE
+```
+
+Orden:
+
+```text
+product_id ASC
+```
+
+`branch_id` es fijo para la compra.
+
+Despues del lock, releer:
+
+- `quantity_base`;
+- `average_cost_base`;
+- `version`.
+
+El weighted average se calcula exclusivamente desde esa lectura autoritativa.
+
+#### inventory_balances inexistentes
+
+Este es el unico saldo/posicion que `CONFIRM_PURCHASE` puede crear como parte de este protocolo.
+
+Para `received_qty_base > 0`:
+
+1. deduplicar `product_id`;
+2. procesar `product_id ASC`;
+3. asegurar que exista `inventory_balances(branch_id, product_id)` mediante `INSERT ... ON CONFLICT DO NOTHING` o mecanismo equivalente;
+4. despues adquirir/releer la fila real `FOR UPDATE`;
+5. calcular desde el estado committed/autoritativo observado.
+
+Si otra transaccion inserto la misma PK y todavia no hizo `COMMIT`, la operacion conflictiva puede esperar su resolucion. Despues `CONFIRM_PURCHASE` debe ejecutar `SELECT ... FOR UPDATE` y releer el estado real.
+
+Nunca asumir `Q = 0` solo porque discovery no vio la fila.
+
+Las carreras tecnicas de unicidad/UPSERT o esperas por la PK no son `PURCHASE_INVENTORY_INCONSISTENT`.
+
+Mantener `version`:
+
+- fila realmente nueva: `DEFAULT 0`;
+- fila existente modificada: `version = version + 1` una sola vez.
+
+#### replenishment_positions
+
+`CONFIRM_PURCHASE` no crea `replenishment_positions` faltantes.
+
+Las allocations que `CONFIRM_PURCHASE` resuelve son historicas y preexistentes. Para cada allocation relevante debe existir su:
+
+```text
+replenishment_positions(branch_id, product_id, channel)
+```
+
+Si falta, devolver `PURCHASE_REPLENISHMENT_INCONSISTENT`. No hacer `INSERT`, `UPSERT`, autorepair ni creacion silenciosa.
+
+Las positions existentes se bloquean:
+
+```text
+FOR UPDATE ORDER BY product_id ASC, channel ASC
+```
+
+Despues se releen:
+
+- `demand_qty_base`;
+- `committed_qty_base`;
+- `available_to_order_base`;
+- `version`.
+
+Luego se recalculan/validan los deltas ya cerrados.
+
+#### replenishment_allocations
+
+Despues de tener bloqueada su `replenishment_positions` correspondiente, bloquear las allocations que esta purchase va a modificar:
+
+```text
+FOR UPDATE
+ORDER BY purchase_order_item_id ASC, sale_item_id ASC, id ASC
+```
+
+`CONFIRM_PURCHASE` modifica:
+
+- `fulfilled_qty_base`;
+- `released_qty_base`.
+
+No tomar allocations antes de positions.
+
+Preservar la invariante global ya congelada: toda mutacion de allocations, positions o movements de reposicion debe realizarse manteniendo bloqueada la `replenishment_positions` correspondiente.
+
+`replenishment_allocation_fulfillments` no necesita pre-lock propio. Se inserta despues bajo allocation lock, FKs, UNIQUE y transaccion comun.
+
+#### Discovery vs estado autoritativo
+
+Discovery no autoritativo puede usarse para descubrir:
+
+- `purchase_order_id`;
+- `branch_id`, `supplier_id`, `replenishment_channel`;
+- `product_id` positivos;
+- `sale_item_id` relevantes;
+- position keys;
+- allocation ids.
+
+No producir efectos desde esas lecturas.
+
+Despues de adquirir todos los locks en el orden definitivo, hacer authoritative reread/recompute de al menos:
+
+- `purchases`;
+- `purchase_items`;
+- `purchase_order_items`;
+- `sale_items` relevantes;
+- datos necesarios de devoluciones `RESTOCK` confirmadas;
+- `replenishment_allocations` actuales;
+- allocations externas previas necesarias;
+- `inventory_balances`;
+- `replenishment_positions`.
+
+Recalcular:
+
+- purchase fingerprint;
+- `current_sale_item_demand`;
+- `fulfilled_prior`;
+- `external_prior_active_reserved`;
+- SAFE;
+- `planned_fulfill_delta`;
+- `planned_release_delta`;
+- position deltas;
+- inventory received aggregate;
+- weighted average.
+
+Ningun calculo de discovery es definitivo.
+
+#### Compatibilidad con CONFIRM_ORDER
+
+`CONFIRM_ORDER` usa:
+
+```text
+sale_items FOR KEY SHARE -> replenishment_positions
+```
+
+`CONFIRM_PURCHASE` usa:
+
+```text
+sale_items FOR KEY SHARE -> inventory_balances -> replenishment_positions
+```
+
+Aunque `CONFIRM_ORDER` use FIFO historico para adquirir sus `sale_items` y `CONFIRM_PURCHASE` use `sale_items.id ASC`, no existe espera mutua entre ambos por esos row locks porque `FOR KEY SHARE` vs `FOR KEY SHARE` es compatible.
+
+El requisito global compartido sigue siendo:
+
+```text
+sale_items -> replenishment_positions
+```
+
+ORDER que crea nuevas reservas usa `sale_items FOR KEY SHARE -> replenishment_positions FOR UPDATE`. La position serializa modificacion de `committed_qty_base` y allocations. Despues de obtener position lock, `CONFIRM_PURCHASE` debe releer las allocations relevantes y recalcular `external_prior_active_reserved` antes de materializar SAFE. No conservar un resultado SAFE calculado solo antes de locks.
+
+#### Compatibilidad con CONFIRM_RETURN
+
+`CONFIRM_RETURN` mantiene conceptualmente:
+
+```text
+sale_items FOR UPDATE -> inventory_balances -> replenishment_positions
+```
+
+`CONFIRM_PURCHASE` debe mantener:
+
+```text
+sale_items FOR KEY SHARE -> inventory_balances FOR UPDATE -> replenishment_positions FOR UPDATE
+```
+
+Ambos usan orden fisico compatible para `sale_items`: `sale_items.id ASC`.
+
+Si RETURN obtiene primero `FOR UPDATE`, PURCHASE espera antes de tener locks de inventory/replenishment.
+
+Si PURCHASE obtiene primero `FOR KEY SHARE`, RETURN espera antes de tener locks de inventory/replenishment.
+
+Asi no puede ocurrir que PURCHASE calcule demanda antigua, RETURN reduzca demanda y PURCHASE luego reduzca nuevamente usando estado obsoleto. Despues de obtener los locks, PURCHASE debe releer/recalcular RESTOCK confirmado y SAFE.
+
+#### Compatibilidad con CONFIRM_SALE
+
+`CONFIRM_SALE` mantiene:
+
+```text
+inventory_balances -> replenishment_positions
+```
+
+Por tanto PURCHASE debe conservar exactamente:
+
+```text
+inventory_balances -> replenishment_positions
+```
+
+Nunca:
+
+```text
+replenishment_positions -> inventory_balances
+```
+
+Si PURCHASE obtiene inventory primero, materializa recepcion/costo y SALE posteriormente observa el nuevo saldo.
+
+Si SALE obtiene inventory primero, SALE confirma desde su saldo autoritativo y PURCHASE, cuando obtiene el lock, relee `quantity_base`, `average_cost_base` y `version`, y calcula desde el estado nuevo.
+
+No hay lost update de quantity ni average cost.
+
+#### Dos CONFIRM_PURCHASE concurrentes
+
+Casos cubiertos:
+
+- Mismo producto y distinta position: serializan por `inventory_balances`.
+- Mismo producto y misma position: inventory primero y luego position serializan ambos efectos.
+- Multiples productos: todos los `inventory_balances` se adquieren en `product_id ASC`.
+- Balance inexistente coincidente: ensure por `product_id ASC`, `FOR UPDATE` posterior y reread autoritativo.
+- Allocations relacionadas con el mismo `sale_item`: `sale_items` se adquieren en `id ASC`, positions en `product_id/channel ASC` y allocations en orden estable posterior.
+
+No introducir locks tardios que rompan ese orden.
+
+#### Matriz conceptual de deadlock
+
+```text
+CONFIRM_SALE:
+inventory_balances product_id ASC
+-> replenishment_positions product_id/channel ASC
+
+CONFIRM_RETURN:
+sale_items id ASC
+-> inventory_balances product_id ASC
+-> replenishment_positions product_id/channel ASC
+
+CONFIRM_ORDER:
+sale_items FOR KEY SHARE
+-> replenishment_positions product_id/channel ASC
+
+CONFIRM_PURCHASE:
+sale_items id ASC
+-> inventory_balances product_id ASC
+-> replenishment_positions product_id/channel ASC
+-> replenishment_allocations purchase_order_item_id/sale_item_id/id ASC
+```
+
+`CONFIRM_PURCHASE` evita `replenishment_positions -> sale_items` y evita `replenishment_positions -> inventory_balances`.
+
+El riesgo intra-`sale_items` contra RETURN motiva usar `sale_items.id ASC` para PURCHASE aunque el calculo SAFE conserve FIFO historico.
+
+No hay ciclo entre clases de recursos si PURCHASE mantiene `sale_items -> inventory_balances -> replenishment_positions -> allocations`.
+
+No hay ciclo intra-`inventory_balances` si todos usan `product_id ASC`.
+
+No hay ciclo intra-`replenishment_positions` si todos usan `product_id ASC, channel ASC`.
+
+No hay ciclo intra-`replenishment_allocations` si PURCHASE usa el orden estable definido y no introduce locks tardios inversos.
+
+#### Recursos sin pre-lock propio
+
+No agregar locks por costumbre sobre:
+
+- `replenishment_allocation_fulfillments`: `INSERT` + UNIQUE/FKs bajo locks de allocation/position.
+- `inventory_movements`: append-only `INSERT`.
+- `replenishment_movements`: append-only `INSERT`.
+- `audit_log`: futuro append-only `INSERT`.
+- `document_sequences`: no participa en `CONFIRM_PURCHASE`.
+
+#### Fallos tecnicos vs dominio
+
+Dominio deterministico incluye:
+
+- `PURCHASE_DRAFT_STALE`;
+- `PURCHASE_REPLENISHMENT_INCONSISTENT`;
+- `PURCHASE_INVENTORY_INCONSISTENT`;
+- demas codigos ya cerrados para validaciones del `DRAFT`, scope y autorizacion.
+
+Tecnico / retryable incluye:
+
+- deadlock detectado por PostgreSQL;
+- lock timeout;
+- conexion/infraestructura;
+- carrera tecnica de unique/UPSERT cuando aplique;
+- cualquier fallo transitorio equivalente.
+
+Los fallos tecnicos no deben convertirse automaticamente en `idempotency_keys.status = 'FAILED'` con un error de dominio.
+
+`PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING` conserva su lifecycle especial no-`FAILED` y retryable ya cerrado.
 
 ### difference_reason
 
@@ -2020,7 +2391,7 @@ Debe hacer rollback y devolver error deterministico. El usuario/flujo de edicion
 
 ## 20. Catalogo de errores cerrado hasta este micro-hito
 
-Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto solo en lo que dependa de locks globales, isolation, audit y atomicidad global final.
+Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto solo en lo que dependa de audit, estados finales, idempotencia `COMPLETED` y atomicidad global final.
 
 Idempotencia:
 
@@ -2370,70 +2741,99 @@ FASE A no produce efectos de negocio:
 
 ## 34. FASE B - Estructura actual
 
-FASE B aun no esta completa en este borrador.
+FASE B aun no esta completa en este borrador porque faltan audit, estados finales, idempotencia `COMPLETED` y `COMMIT` global. Queda cerrada la estructura de concurrencia: discovery, lock acquisition y authoritative recompute + materialization.
 
-Queda congelado el prefijo y el bloque de validaciones del `DRAFT` antes de cualquier efecto:
+### 34.1 DISCOVERY no autoritativo
 
-1. Bloquear/verificar `idempotency_key` reservada.
-2. Obtener metadata preleida necesaria del `purchase`.
-3. Bloquear `purchase_orders(id) FOR UPDATE`.
-4. Bloquear `purchases(id) FOR UPDATE`.
-5. Revalidar `purchase_order_id`, `branch_id`, `supplier_id` y `replenishment_channel` contra el pre-read.
-6. Validar tenant/business visible.
-7. Validar branch: `branches.active` y pertenencia a `business_id` autenticado segun la frontera segura definida.
-8. Validar `users.status = 'ACTIVE'`.
-9. Validar acceso a `purchases.branch_id` mediante `user_branches`.
-10. Validar permiso funcional `PURCHASES_CONFIRM` mediante `user_roles -> roles -> role_permissions -> permissions`.
-11. Resolver estados/reconciliacion historica si corresponde.
-12. Si camino normal: `purchase DRAFT + order CONFIRMED`.
-13. Bloquear/leer `purchase_items` por `line_number ASC, id ASC`.
-14. Validar `SUPPLIER_BUSINESS_MISMATCH` si el supplier no pertenece al business de la branch.
-15. Validar `PRODUCT_BUSINESS_MISMATCH` si alguna linea referencia producto de otro business.
-16. Recalcular purchase fingerprint autoritativo.
-17. Comparar contra `expected_purchase_fingerprint`.
-18. Aplicar politica historica de supplier/product/unit: inactividad posterior no bloquea recepcion; multiempresa si bloquea.
-19. Validar relacion producto/order-item: si hay `purchase_order_item_id`, el producto debe corresponder a esa linea; productos equivocados se representan con linea original faltante y linea no pedida.
-20. Validar consistencia quantity/factor: `received_qty`, `factor_to_base_snapshot` y `received_qty_base` coherentes segun `ROUND(received_qty * factor_to_base_snapshot, 4)`.
-21. Para cada `purchase_order_item` del pedido origen, obtener todas sus `purchase_items` asociadas, calcular `total_received_base = COALESCE(SUM(received_qty_base), 0)` y comparar contra `purchase_order_items.ordered_qty_base` sin asumir 1:1 ni omitir order items sin linea recibida.
-22. Validar `difference_reason` para lineas no pedidas, diferencias agregadas contra pedido cuando existen lineas asociadas y lineas explicitas con recibido cero.
-23. Validar `actual_unit_cost_base` como costo real persistido no negativo, sin sustituirlo por pedido, catalogo, proveedor ni costo promedio.
-24. Validar subtotal de linea con `ROUND(received_qty_base * actual_unit_cost_base, 2)`.
-25. Validar `tax_snapshot` v1 segun `docs/domain/tax-snapshot-v1.md`.
-26. Validar `tax_total` contra `tax_snapshot` v1.
-27. Validar relaciones de total de linea: `purchase_items.total = purchase_items.subtotal + purchase_items.tax_total`.
-28. Validar sumas/totales de header: subtotal, `tax_total`, total por suma de lineas y `total = subtotal + tax_total`; si no hay lineas, todos deben ser cero.
-29. Calcular recepcion aplicable con REPLENISHMENT-FIRST: `received_applicable_to_replenishment_base` por `purchase_order_item`.
-30. Inicializar plan provisional por `purchase_order_item` con `planned_remaining_received_applicable = received_applicable_to_replenishment_base`.
-31. Descubrir reservations preexistentes del `purchase_order` origen y del mismo `sale_item` necesarias para SAFE.
-32. Evaluar precedence externa historica por `purchase_orders.confirmed_at ASC`, `purchase_orders.id ASC`, `purchase_order_items.line_number ASC`, `purchase_order_items.id ASC`, `replenishment_allocations.id ASC`.
-33. Recorrer `purchase_order_items` del pedido actual por `line_number ASC, id ASC`.
-34. Dentro de cada order item, recorrer allocations destino por FIFO de demanda: `sales.confirmed_at ASC`, `sales.id ASC`, `sale_items.line_number ASC`, `sale_items.id ASC`, `replenishment_allocations.id ASC`.
-35. Para cada allocation, calcular SAFE usando el pool provisional y `fulfilled_prior` que incluye `planned_fulfill_delta` anteriores de esta misma operacion cuando correspondan.
-36. Si cualquier allocation produce `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, abortar FASE B completa sin effects ni fulfillment/detail persistido.
-37. Si es SAFE, registrar `planned_fulfill_delta = safe_fulfill_now` y consumir `planned_remaining_received_applicable`; nunca puede ser negativo y, si llega a `0`, las allocations posteriores reciben `receipt_cap = 0`.
-38. Solo cuando toda la compra tenga plan SAFE, construir capacidades source REPLENISHMENT-FIRST por `purchase_order_item` recorriendo `purchase_items` en source FIFO `line_number ASC, id ASC`.
-39. Consumir source capacities acumulativamente contra allocations destino para producir `detail_delta`, sin reiniciar capacidad por allocation.
-40. Para cada allocation, calcular `planned_release_delta = remaining_reserved - planned_fulfill_delta`.
-41. Validar terminalizacion: `planned_fulfill_delta + planned_release_delta = remaining_reserved` y, al aplicar, `new_fulfilled_qty_base + new_released_qty_base = reserved_qty_base`.
-42. Planear `PURCHASE_FULFILL` para cada `planned_fulfill_delta > 0` y `ORDER_RELEASE` para cada `planned_release_delta > 0`, ambos referenciando `replenishment_allocations.id`.
-43. Agrupar `planned_fulfill_delta` y `planned_release_delta` por `branch_id`, `product_id`, `channel`.
-44. Validar conceptualmente que cada `replenishment_positions` esperada exista, coincida exactamente con las keys de sus allocations y que aplicar los deltas no produzca negativos.
-45. Planear inventory receipt: seleccionar `purchase_items.received_qty_base > 0`; si no hay lineas positivas, no hay `PURCHASE_RECEIPT` ni efecto de balance.
-46. Agrupar inventory receipt por `(branch_id, product_id)` y calcular `received_qty_total` y `received_value_total` con `NUMERIC` exacto.
-47. Para cada balance afectado, leer el saldo autoritativo protegido por los locks que correspondan y planear `new_quantity_base` y `new_average_cost_base` segun promedio ponderado agregado.
-48. Para balances inexistentes con `received_qty_total > 0`, planear creacion con `version = 0` por default db-4; para balances existentes, planear `version = version + 1` exactamente una vez por `(branch_id, product_id)`.
-49. Planear un `PURCHASE_RECEIPT` por cada `purchase_item` positiva, con `unit_cost_base = actual_unit_cost_base`, referencia a `purchase_items.id` y `balance_after_base` deterministico por producto ordenando `purchase_items.line_number ASC, id ASC`.
-50. Verificar plan de inventario: movements equivalen a `received_qty_base`, ultimo `balance_after_base` por producto coincide con `new quantity_base`, costo promedio usa el calculo canonico y no hay efecto para lineas con cantidad cero.
-51. Antes de materializar efectos de replenishment o inventario, deben estar adquiridos todos los locks necesarios segun el contrato global pendiente. Este micro-hito no fija el orden global final de locks.
-52. Bajo esos locks, materializar en la misma FASE B los efectos de replenishment ya cerrados: detail, allocation fulfillment/release, `PURCHASE_FULFILL`, `ORDER_RELEASE`, `replenishment_positions` agregadas y `version` de positions.
-53. Bajo esos locks, materializar en la misma FASE B los efectos de inventario cerrados: crear o actualizar `inventory_balances`, recalcular `average_cost_base`, incrementar `version` solo en UPDATE e insertar todos los `PURCHASE_RECEIPT` con `balance_after_base`.
-54. Verificar reconciliacion de reposicion: `SUM(new detail rows)=planned_fulfill_delta`, `SUM(all historical detail rows)=new_allocation_fulfilled_qty_base`, movements equivalen a los deltas agregados y cada position refleja exactamente esos deltas.
-55. Verificar reconciliacion de inventario: movements equivalen a cantidades recibidas positivas, unit costs coinciden con `actual_unit_cost_base`, balances reflejan los deltas agregados y el promedio ponderado persistido coincide con el calculo canonico.
-56. Si `planned_fulfill_delta = 0`, no insertar detail rows ni `PURCHASE_FULFILL` para esa allocation; si `planned_release_delta = 0`, no insertar `ORDER_RELEASE` para esa allocation; si `received_qty_base = 0`, no insertar `PURCHASE_RECEIPT` ni tocar balance por esa linea.
-57. Continuar hacia locks globales finales, isolation, audit, estados finales y atomicidad global todavia pendientes.
-58. Solo despues de todos los efectos futuros correctamente definidos podra marcar `purchase CONFIRMED`, cerrar `purchase_order`, auditar, marcar idempotencia `COMPLETED` y hacer `COMMIT`.
+Antes o al inicio de FASE B, el flujo puede descubrir recursos necesarios:
 
-No se introduce todavia el orden global final de locks de reposicion/inventario. Los efectos de inventory y replenishment conviven en la misma FASE B y deben materializarse bajo todos los locks necesarios cuando el contrato global se cierre. No se producen efectos antes de completar todas las validaciones cerradas del `DRAFT`, superar la evaluacion SAFE EARLY RESOLUTION y validar la consistencia de reposicion e inventario cerrada hasta este micro-hito.
+1. Obtener metadata preleida necesaria del `purchase`: `purchase_order_id`, `branch_id`, `supplier_id` y `replenishment_channel`.
+2. Descubrir `product_id` positivos para inventario.
+3. Descubrir `sale_item_id` relevantes para SAFE.
+4. Descubrir keys de `replenishment_positions` esperadas.
+5. Descubrir ids de `replenishment_allocations` candidatas.
+
+Estas lecturas no autorizan efectos, no cierran SAFE, no cierran weighted average y no sustituyen el fingerprint autoritativo.
+
+### 34.2 LOCK ACQUISITION
+
+Adquirir locks en el orden global definitivo:
+
+1. Bloquear/verificar `idempotency_key` reservada `FOR UPDATE`.
+2. Bloquear `purchase_orders(id) FOR UPDATE`.
+3. Bloquear `purchases(id) FOR UPDATE`.
+4. Leer `purchase_order_items` con simple `SELECT` autoritativo bajo el mutex del pedido, orden `line_number ASC, id ASC`.
+5. Leer `purchase_items` con simple `SELECT` autoritativo bajo el mutex de la compra, orden `line_number ASC, id ASC`.
+6. Deduplicar y bloquear `sale_items` relevantes `FOR KEY SHARE ORDER BY sale_items.id ASC`.
+7. Para productos con `received_qty_base > 0`, asegurar `inventory_balances` inexistentes por `product_id ASC` y despues bloquear/releer `inventory_balances FOR UPDATE ORDER BY product_id ASC`.
+8. Bloquear `replenishment_positions` existentes `FOR UPDATE ORDER BY product_id ASC, channel ASC`; si falta una position esperada, fallar con `PURCHASE_REPLENISHMENT_INCONSISTENT`, no crearla.
+9. Bloquear `replenishment_allocations` que la compra va a terminalizar/modificar `FOR UPDATE ORDER BY purchase_order_item_id ASC, sale_item_id ASC, id ASC`.
+
+No bloquear `document_sequences`.
+
+No tomar `replenishment_allocations` antes de sus positions.
+
+No adquirir `sale_items` tardiamente despues de positions.
+
+No invertir `replenishment_positions -> inventory_balances`.
+
+### 34.3 AUTHORITATIVE REREAD / RECOMPUTE + MATERIALIZATION
+
+Bajo los locks anteriores:
+
+1. Revalidar `purchase_order_id`, `branch_id`, `supplier_id` y `replenishment_channel` contra el pre-read.
+2. Validar tenant/business visible.
+3. Validar branch: `branches.active` y pertenencia a `business_id` autenticado segun la frontera segura definida.
+4. Validar `users.status = 'ACTIVE'`.
+5. Validar acceso a `purchases.branch_id` mediante `user_branches`.
+6. Validar permiso funcional `PURCHASES_CONFIRM` mediante `user_roles -> roles -> role_permissions -> permissions`.
+7. Resolver estados/reconciliacion historica si corresponde.
+8. Si camino normal: `purchase DRAFT + order CONFIRMED`.
+9. Validar `SUPPLIER_BUSINESS_MISMATCH` si el supplier no pertenece al business de la branch.
+10. Validar `PRODUCT_BUSINESS_MISMATCH` si alguna linea referencia producto de otro business.
+11. Recalcular purchase fingerprint autoritativo desde `purchases` y `purchase_items` re-leidos bajo locks.
+12. Comparar contra `expected_purchase_fingerprint`.
+13. Aplicar politica historica de supplier/product/unit: inactividad posterior no bloquea recepcion; multiempresa si bloquea.
+14. Validar relacion producto/order-item: si hay `purchase_order_item_id`, el producto debe corresponder a esa linea; productos equivocados se representan con linea original faltante y linea no pedida.
+15. Validar consistencia quantity/factor: `received_qty`, `factor_to_base_snapshot` y `received_qty_base` coherentes segun `ROUND(received_qty * factor_to_base_snapshot, 4)`.
+16. Para cada `purchase_order_item` del pedido origen, obtener todas sus `purchase_items` asociadas, calcular `total_received_base = COALESCE(SUM(received_qty_base), 0)` y comparar contra `purchase_order_items.ordered_qty_base` sin asumir 1:1 ni omitir order items sin linea recibida.
+17. Validar `difference_reason` para lineas no pedidas, diferencias agregadas contra pedido cuando existen lineas asociadas y lineas explicitas con recibido cero.
+18. Validar `actual_unit_cost_base` como costo real persistido no negativo, sin sustituirlo por pedido, catalogo, proveedor ni costo promedio.
+19. Validar subtotal de linea con `ROUND(received_qty_base * actual_unit_cost_base, 2)`.
+20. Validar `tax_snapshot` v1 segun `docs/domain/tax-snapshot-v1.md`.
+21. Validar `tax_total` contra `tax_snapshot` v1.
+22. Validar relaciones de total de linea: `purchase_items.total = purchase_items.subtotal + purchase_items.tax_total`.
+23. Validar sumas/totales de header: subtotal, `tax_total`, total por suma de lineas y `total = subtotal + tax_total`; si no hay lineas, todos deben ser cero.
+24. Releer/recalcular datos de devoluciones `RESTOCK` confirmadas necesarias para `current_sale_item_demand`.
+25. Releer `replenishment_allocations` actuales y allocations externas previas necesarias.
+26. Recalcular recepcion aplicable con REPLENISHMENT-FIRST: `received_applicable_to_replenishment_base` por `purchase_order_item`.
+27. Recalcular precedence externa historica por `purchase_orders.confirmed_at ASC`, `purchase_orders.id ASC`, `purchase_order_items.line_number ASC`, `purchase_order_items.id ASC`, `replenishment_allocations.id ASC`.
+28. Recorrer `purchase_order_items` del pedido actual por `line_number ASC, id ASC`.
+29. Dentro de cada order item, recorrer allocations destino por FIFO funcional de demanda: `sales.confirmed_at ASC`, `sales.id ASC`, `sale_items.line_number ASC`, `sale_items.id ASC`, `replenishment_allocations.id ASC`.
+30. Recalcular `current_sale_item_demand`, `fulfilled_prior`, `external_prior_active_reserved`, `receipt_cap`, `max_future_fulfill` y `safe_fulfill_now`.
+31. Si cualquier allocation produce `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, abortar FASE B completa sin efectos ni fulfillment/detail persistido.
+32. Si es SAFE, registrar `planned_fulfill_delta = safe_fulfill_now` y consumir `planned_remaining_received_applicable`; nunca puede ser negativo y, si llega a `0`, las allocations posteriores reciben `receipt_cap = 0`.
+33. Solo cuando toda la compra tenga plan SAFE, construir capacidades source REPLENISHMENT-FIRST por `purchase_order_item` recorriendo `purchase_items` en source FIFO `line_number ASC, id ASC`.
+34. Consumir source capacities acumulativamente contra allocations destino para producir `detail_delta`, sin reiniciar capacidad por allocation.
+35. Para cada allocation, calcular `planned_release_delta = remaining_reserved - planned_fulfill_delta`.
+36. Validar terminalizacion: `planned_fulfill_delta + planned_release_delta = remaining_reserved` y, al aplicar, `new_fulfilled_qty_base + new_released_qty_base = reserved_qty_base`.
+37. Planear `PURCHASE_FULFILL` para cada `planned_fulfill_delta > 0` y `ORDER_RELEASE` para cada `planned_release_delta > 0`, ambos referenciando `replenishment_allocations.id`.
+38. Agrupar `planned_fulfill_delta` y `planned_release_delta` por `branch_id`, `product_id`, `channel`.
+39. Validar que cada `replenishment_positions` esperada existe, coincide exactamente con las keys de sus allocations y que aplicar los deltas no produce negativos.
+40. Releer `inventory_balances.quantity_base`, `average_cost_base` y `version` bloqueados.
+41. Agrupar inventory receipt por `(branch_id, product_id)` y calcular `received_qty_total` y `received_value_total` con `NUMERIC` exacto.
+42. Para cada balance afectado, calcular `new_quantity_base` y `new_average_cost_base` desde el saldo autoritativo bloqueado.
+43. Para balances realmente nuevos con `received_qty_total > 0`, conservar `version = 0` por default db-4; para balances existentes, planear `version = version + 1` exactamente una vez por `(branch_id, product_id)`.
+44. Planear un `PURCHASE_RECEIPT` por cada `purchase_item` positiva, con `unit_cost_base = actual_unit_cost_base`, referencia a `purchase_items.id` y `balance_after_base` deterministico por producto ordenando `purchase_items.line_number ASC, id ASC`.
+45. Verificar plan de inventario: movements equivalen a `received_qty_base`, ultimo `balance_after_base` por producto coincide con `new quantity_base`, costo promedio usa el calculo canonico y no hay efecto para lineas con cantidad cero.
+46. Materializar en la misma FASE B los efectos de replenishment ya cerrados: detail, allocation fulfillment/release, `PURCHASE_FULFILL`, `ORDER_RELEASE`, `replenishment_positions` agregadas y `version` de positions.
+47. Materializar en la misma FASE B los efectos de inventario cerrados: crear o actualizar `inventory_balances`, recalcular `average_cost_base`, incrementar `version` solo en UPDATE e insertar todos los `PURCHASE_RECEIPT` con `balance_after_base`.
+48. Verificar reconciliacion de reposicion: `SUM(new detail rows)=planned_fulfill_delta`, `SUM(all historical detail rows)=new_allocation_fulfilled_qty_base`, movements equivalen a los deltas agregados y cada position refleja exactamente esos deltas.
+49. Verificar reconciliacion de inventario: movements equivalen a cantidades recibidas positivas, unit costs coinciden con `actual_unit_cost_base`, balances reflejan los deltas agregados y el promedio ponderado persistido coincide con el calculo canonico.
+50. Si `planned_fulfill_delta = 0`, no insertar detail rows ni `PURCHASE_FULFILL` para esa allocation; si `planned_release_delta = 0`, no insertar `ORDER_RELEASE` para esa allocation; si `received_qty_base = 0`, no insertar `PURCHASE_RECEIPT` ni tocar balance por esa linea.
+51. Continuar hacia audit, estados finales, idempotencia `COMPLETED` y atomicidad global, que siguen pendientes.
+
+No se producen efectos antes de completar validaciones del `DRAFT`, adquirir locks globales, superar SAFE autoritativo y validar la consistencia de reposicion e inventario.
 
 La consistencia supplier/product business puede validarse antes del fingerprint porque protege tenant/integridad. La semantica fiscal completa de `tax_snapshot` v1 queda definida por `docs/domain/tax-snapshot-v1.md` y se valida antes de efectos.
 
@@ -2563,11 +2963,17 @@ Para:
 
 - crash;
 - timeout interno;
+- lock timeout;
+- deadlock detectado por PostgreSQL;
 - perdida de conexion;
 - error inesperado;
 - estado de `COMMIT` desconocido;
+- carrera tecnica de unique/UPSERT al asegurar `inventory_balances`;
+- fallo transitorio equivalente;
 
 no marcar `FAILED` automaticamente.
+
+No convertir estos fallos tecnicos en `PURCHASE_INVENTORY_INCONSISTENT`, `PURCHASE_REPLENISHMENT_INCONSISTENT` ni otro error de dominio.
 
 La key puede permanecer `IN_PROGRESS` hasta vencimiento del lease.
 
@@ -2667,12 +3073,12 @@ El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no
 
 Antes de congelar `CONFIRM_PURCHASE v0.1`, faltan:
 
-- orden global de locks;
-- `READ COMMITTED` final;
-- audit;
+- audit payload final;
 - transicion final `purchases.status = 'CONFIRMED'`;
+- `confirmed_by_user_id` / `confirmed_at` finales;
 - transicion final `purchase_orders.status = 'CLOSED'`;
 - `idempotency_keys.status = 'COMPLETED'` final;
+- `response_body` final;
 - `COMMIT` global final;
 - atomicidad global completa;
 - cierre definitivo completo de `CONFIRM_PURCHASE`;
@@ -2734,4 +3140,17 @@ No quedan como pendientes en este borrador:
 - reconciliacion de inventario;
 - `PURCHASE_INVENTORY_INCONSISTENT`;
 - atomicidad local del bloque de inventario dentro de FASE B;
-- replay/recovery sin duplicar balances ni `PURCHASE_RECEIPT`.
+- replay/recovery sin duplicar balances ni `PURCHASE_RECEIPT`;
+- isolation level `READ COMMITTED` + locks explicitos;
+- orden global definitivo de locks;
+- modo exacto de `purchase_order_items`;
+- modo exacto de `purchase_items`;
+- orden fisico de `sale_items` por `id ASC` separado del FIFO funcional SAFE;
+- compatibilidad con `CONFIRM_SALE`;
+- compatibilidad con `CONFIRM_RETURN`;
+- compatibilidad con `CONFIRM_ORDER`;
+- compatibilidad entre dos `CONFIRM_PURCHASE` concurrentes;
+- creacion/lock de `inventory_balances` inexistentes;
+- `replenishment_positions` faltante no se crea y produce `PURCHASE_REPLENISHMENT_INCONSISTENT`;
+- discovery vs authoritative reread/recompute;
+- separacion de fallos tecnicos/retryables contra errores de dominio.
