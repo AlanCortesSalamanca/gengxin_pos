@@ -1,22 +1,22 @@
 # Modelo físico PostgreSQL v0.5-db-4
 
-Estado: DISEÑO FÍSICO PROPUESTO / NO MATERIALIZADO.
+Estado: VALIDADO / CONGELADO.
 
 Fuente de verdad: `especificacion_maestra_pos_multisucursal_v0.5.md`.
 
 Alcance de esta versión: evolución mínima de `v0.5-db-3`, que permanece VALIDADO / CONGELADO para el alcance que tenía. `v0.5-db-4` conserva el modelo físico validado de db-3 y corrige únicamente el gap físico de trazabilidad cuantitativa entre `replenishment_allocations` y múltiples `purchase_items` al diseñar `CONFIRM_PURCHASE v0.1`.
 
-Este documento no crea todavía DDL, migración ni validation SQL. No define framework backend, frontend ni aplicación de escritorio. No cambia las reglas de negocio de Policy A, no define todavía inventory effects, costo promedio, locks globales ni `READ COMMITTED` final de `CONFIRM_PURCHASE`.
+Este documento congela el DDL y la validation SQL de db-4. No define framework backend, frontend ni aplicación de escritorio. No cambia las reglas de negocio de Policy A, no define todavía inventory effects, costo promedio, locks globales ni `READ COMMITTED` final de `CONFIRM_PURCHASE`.
 
-Delta único propuesto respecto a db-3:
+Delta único materializado respecto a db-3:
 
-- Agregar `replenishment_allocation_fulfillments` como detalle cuantitativo many-to-many entre `replenishment_allocations` y `purchase_items`.
-- Eliminar conceptualmente `replenishment_allocations.purchase_item_id`.
-- Eliminar la regla física db-3 `fulfilled_qty_base > 0 => purchase_item_id IS NOT NULL` y su constraint `ck_replenishment_allocations_fulfilled_purchase` como constraint vigente de db-4.
-- Agregar claves candidatas auxiliares para soportar FKs compuestas desde el detail.
-- Agregar FKs compuestas que garantizan que allocation y purchase item pertenecen al mismo `purchase_order_item`.
-- Agregar CHECK `fulfilled_qty_base > 0` en el detail.
-- Agregar UNIQUE e índice mínimos para el detail.
+- Se agregó `replenishment_allocation_fulfillments` como detalle cuantitativo many-to-many entre `replenishment_allocations` y `purchase_items`.
+- Se eliminó `replenishment_allocations.purchase_item_id`.
+- Se eliminó la regla física db-3 `fulfilled_qty_base > 0 => purchase_item_id IS NOT NULL` y su constraint `ck_replenishment_allocations_fulfilled_purchase` como constraint vigente de db-4.
+- Se agregaron claves candidatas auxiliares para soportar FKs compuestas desde el detail.
+- Se agregaron FKs compuestas que garantizan que allocation y purchase item pertenecen al mismo `purchase_order_item`.
+- Se agregó CHECK `fulfilled_qty_base > 0` en el detail.
+- Se agregaron UNIQUE e índice mínimos para el detail.
 
 Motivación física: db-3 permite múltiples `purchase_items` para el mismo `purchase_order_item`, y una `replenishment_allocation` puede requerir fulfillment proveniente de varias líneas físicas de recepción. A su vez, una `purchase_item` puede cubrir varias allocations. La columna singular `replenishment_allocations.purchase_item_id` no representa correctamente todos los casos válidos, y `UNIQUE(sale_item_id, purchase_order_item_id)` impide partir la allocation para modelar sus fuentes.
 
@@ -24,9 +24,33 @@ Compatibilidad: db-4 mantiene todas las invariantes previas de ventas, cotizacio
 
 Evidencia real de validación:
 
-- Pendiente. `database/schema-v0.5-db-4.sql` todavía no existe en este micro-hito.
-- Pendiente. `database/validation-v0.5-db-4.sql` todavía no existe en este micro-hito.
-- El siguiente micro-hito físico deberá materializar un schema acumulativo completo derivado de `database/schema-v0.5-db-3.sql` y aplicar únicamente los cambios físicos cerrados en este documento.
+- PostgreSQL: 17.11.
+- Contenedor usado: `gengxin-postgres`.
+- Base temporal usada: `gengxin_pos_schema_db4_test`.
+- `database/schema-v0.5-db-4.sql` ejecutó completo contra PostgreSQL 17.11.
+- El DDL llegó a `COMMIT` exitosamente.
+- No hubo errores SQL inesperados durante ejecución de schema db-4.
+- `database/validation-v0.5-db-4.sql` ejecutó completo contra la misma base temporal.
+- Validation terminó en `ROLLBACK`.
+- Los fixtures de validation no persistieron.
+- Veredicto: `VALIDATION DB-4 PASS`.
+
+Commits de evidencia técnica:
+
+- `08c7923 feat(database): materialize db-4 allocation fulfillment schema`.
+- `6292c6d fix(database): avoid truncated db-4 identifiers`.
+- `6694de4 test(database): validate db-4 allocation fulfillment integrity`.
+
+Conteos físicos confirmados por PostgreSQL:
+
+- Tablas: 52.
+- ENUMs: 19.
+- FKs: 145.
+- CHECKs: 82.
+- Índices: 194, informativo porque incluye índices implícitos.
+- Triggers no internos: 40.
+
+A partir de este punto, `v0.5-db-4` queda VALIDADO / CONGELADO. Cualquier cambio físico posterior debe producir una nueva versión del modelo físico, schema y validation; no debe editarse silenciosamente db-4.
 
 ## 1. Decisiones generales
 
@@ -297,7 +321,7 @@ Tabla agregada necesaria:
 - `replenishment_allocations.purchase_item_id` se elimina en db-4. La fuente exacta de fulfillment ya no vive en una columna singular.
 - La regla física db-3 `fulfilled_qty_base > 0 => purchase_item_id IS NOT NULL` y el constraint `ck_replenishment_allocations_fulfilled_purchase` dejan de ser vigentes en db-4.
 
-Estructura objetivo de `replenishment_allocations` en db-4:
+Estructura vigente de `replenishment_allocations` en db-4:
 
 - `id`.
 - `branch_id`.
@@ -336,15 +360,18 @@ Restricciones e integridad de `replenishment_allocation_fulfillments`:
 - `fulfilled_qty_base > 0`. No se permiten detail rows de cantidad cero o negativa.
 - PK: `id`.
 - UNIQUE lógico: `(replenishment_allocation_id, purchase_item_id)`.
+- Nombre físico validado del CHECK: `ck_replenishment_allocation_fulfillments_qty_positive`.
+- Nombre físico validado del UNIQUE detail: `uq_replenishment_allocation_fulfillments_alloc_purchase_item`.
 - Una misma pareja allocation/source receipt debe tener como máximo una fila. Si una misma `purchase_item` aporta varias porciones durante el cálculo de una sola confirmación, se consolidan conceptualmente antes de persistir una sola detail row para esa pareja.
-- FK simple: `replenishment_allocation_id -> replenishment_allocations.id`.
-- FK simple: `purchase_item_id -> purchase_items.id`.
+- FK simple validada: `fk_replenishment_allocation_fulfillments_allocation`, `replenishment_allocation_id -> replenishment_allocations.id`.
+- FK simple validada: `fk_replenishment_allocation_fulfillments_purchase_item`, `purchase_item_id -> purchase_items.id`.
 - `ON DELETE` default restrictivo / `NO ACTION`. No usar cascade: no hay delete operativo normal de allocations, purchases ni detail histórico confirmado.
 - `purchase_order_item_id` se duplica deliberadamente para integridad física cross-table. No es una segunda autoridad de negocio.
-- Clave candidata auxiliar requerida en `replenishment_allocations`: `UNIQUE(id, purchase_order_item_id)`.
-- Clave candidata auxiliar requerida en `purchase_items`: `UNIQUE(id, purchase_order_item_id)`.
-- FK compuesta objetivo: `(replenishment_allocation_id, purchase_order_item_id) -> replenishment_allocations(id, purchase_order_item_id)`.
-- FK compuesta objetivo: `(purchase_item_id, purchase_order_item_id) -> purchase_items(id, purchase_order_item_id)`.
+- Clave candidata auxiliar validada en `replenishment_allocations`: `uq_replenishment_allocations_id_order_item`, `UNIQUE(id, purchase_order_item_id)`.
+- Clave candidata auxiliar validada en `purchase_items`: `uq_purchase_items_id_order_item`, `UNIQUE(id, purchase_order_item_id)`.
+- FK compuesta validada: `fk_replenishment_allocation_fulfillments_allocation_order_item`, `(replenishment_allocation_id, purchase_order_item_id) -> replenishment_allocations(id, purchase_order_item_id)`.
+- FK compuesta validada: `fk_replenishment_allocation_fulfillments_purchase_item_order`, `(purchase_item_id, purchase_order_item_id) -> purchase_items(id, purchase_order_item_id)`.
+- UNIQUE validado heredado de allocation: `uq_replenishment_allocations_sale_order`, `(sale_item_id, purchase_order_item_id)`.
 
 Con las FKs compuestas:
 
@@ -360,7 +387,7 @@ Invariantes agregadas de detail:
 - Por pareja allocation/purchase_item: una sola fila.
 - Por `purchase_order_item`: `SUM(detail.fulfilled_qty_base)` de todas sus allocations no puede superar `received_applicable_to_replenishment_base`.
 - Por `purchase_item`: la suma atribuida a fulfillment no puede superar su porción física elegible dentro del pool REPLENISHMENT-FIRST.
-- Las invariantes agregadas que dependen de SUM entre filas quedan para servicio/transacción y `database/validation-v0.5-db-4.sql`. No se diseña trigger diferido en este micro-hito.
+- Las invariantes agregadas que dependen de SUM entre filas quedan para servicio/transacción y `database/validation-v0.5-db-4.sql`. No existe CHECK/FK directo que fuerce `SUM(detail)=fulfilled` en PostgreSQL. No se diseña trigger diferido en db-4.
 
 `replenishment_allocations.fulfilled_qty_base` se conserva porque:
 
@@ -396,7 +423,7 @@ Ejemplo con excedente:
 - Detail: A-P1 = 3, A-P2 = 2.
 - Las otras 5 unidades de P2 pueden entrar a inventario, pero no forman parte del fulfillment detail. Este documento no diseña inventario.
 
-`replenishment_allocation_fulfillments` es detalle histórico creado al confirmar compra. A nivel de servicio no se edita ni elimina después de confirmación. No se declara todavía trigger append-only en db-4; si después la validación runtime demuestra necesidad de mayor defensa física, se reevaluará formalmente.
+`replenishment_allocation_fulfillments` es detalle histórico creado al confirmar compra. A nivel de servicio no se edita ni elimina después de confirmación. No se declara trigger append-only en db-4. Cualquier refuerzo físico posterior deberá evaluarse en una nueva versión del modelo físico, schema y validation.
 
 ### Pedidos y compras
 
@@ -551,9 +578,9 @@ Estas reglas requieren leer varias filas, bloquear recursos o coordinar document
 - Cumplir el límite REPLENISHMENT-FIRST por `purchase_order_item`.
 - Cumplir source FIFO de `purchase_items` por `line_number ASC, id ASC` al construir detail.
 - No exceder la cantidad física elegible de cada `purchase_item`.
-- Validar las invariantes agregadas mediante `database/validation-v0.5-db-4.sql` cuando se materialice db-4.
+- Validar las invariantes agregadas mediante `database/validation-v0.5-db-4.sql`; db-4 ya cuenta con validation PASS para los fixtures físicos definidos.
 
-No se propone todavía trigger para `SUM(detail)=fulfilled`. Queda como invariante transaccional de servicio más validation SQL. Si la validación runtime demuestra necesidad de mayor defensa física, se reevaluará en un micro-hito separado.
+No se propone trigger para `SUM(detail)=fulfilled` en db-4. Queda como invariante transaccional de servicio más validation SQL. Cualquier refuerzo físico posterior deberá evaluarse en una nueva versión del modelo físico, schema y validation.
 
 ## 8. Decisiones pendientes
 
@@ -564,11 +591,10 @@ No se propone todavía trigger para `SUM(detail)=fulfilled`. Queda como invarian
 - Definir proveedor PAC, almacenamiento seguro de XML/PDF y mecanismo de cifrado de secretos fiscales.
 - Definir si ciertos catálogos fiscales SAT se cargarán como tablas específicas o se mantendrán en `tax_profiles` y snapshots.
 - Definir estándar final de nombres visibles de folios por sucursal.
-- Materializar el SQL exacto de db-4 en `database/schema-v0.5-db-4.sql`.
-- Crear y ejecutar `database/validation-v0.5-db-4.sql`.
 - Integrar `replenishment_allocation_fulfillments` en el contrato transaccional de `CONFIRM_PURCHASE`.
 - Definir `PURCHASE_FULFILL` y `ORDER_RELEASE` definitivos.
-- Definir inventory effects, costo promedio, locks globales, `READ COMMITTED` final, audit y atomicidad completa de `CONFIRM_PURCHASE`.
+- Definir `replenishment_positions` final para `CONFIRM_PURCHASE`.
+- Definir inventory effects, average cost/costo promedio, locks globales, `READ COMMITTED` final, audit y atomicidad completa de `CONFIRM_PURCHASE`.
 
 No quedan pendientes en este documento:
 
@@ -578,21 +604,23 @@ No quedan pendientes en este documento:
 
 ## 9. Archivo DDL
 
-El DDL materializado futuro será:
+El DDL vigente de db-4 es:
 
 `database/schema-v0.5-db-4.sql`
 
-Este archivo todavía no se crea en este micro-hito.
+Este archivo fue ejecutado exitosamente contra PostgreSQL 17.11 en la base temporal `gengxin_pos_schema_db4_test` usando el contenedor `gengxin-postgres`.
 
-El siguiente micro-hito materializará un schema acumulativo completo partiendo de `database/schema-v0.5-db-3.sql` y aplicando únicamente los cambios físicos cerrados en este documento:
+El schema acumulativo completo parte de `database/schema-v0.5-db-3.sql` y aplica únicamente los cambios físicos cerrados en este documento:
 
 - nueva tabla `replenishment_allocation_fulfillments`;
 - eliminación de `replenishment_allocations.purchase_item_id`;
-- eliminación del constraint `ck_replenishment_allocations_fulfilled_purchase` como vigente;
-- claves candidatas auxiliares necesarias;
-- FKs compuestas desde detail;
+- eliminación del constraint `ck_replenishment_allocations_fulfilled_purchase`;
+- eliminación del índice `ix_replenishment_allocations_purchase_item`;
+- claves candidatas auxiliares `uq_replenishment_allocations_id_order_item` y `uq_purchase_items_id_order_item`;
+- FKs simples y compuestas desde detail;
 - CHECK `fulfilled_qty_base > 0`;
-- UNIQUE e índice mínimos.
+- UNIQUE `uq_replenishment_allocation_fulfillments_alloc_purchase_item`;
+- índice `ix_replenishment_allocation_fulfillments_purchase_item`.
 
 No incluir en db-4 cambios de inventario, average cost, nuevos estados, audit, locks, `READ COMMITTED`, cambios fiscales, cambios de caja, cambios a ventas/devoluciones ni limpieza no relacionada.
 
@@ -613,23 +641,44 @@ No se refactoriza todo el esquema en db-4 para incluir `business_id` redundante 
 
 ## 11. Validación real
 
-El archivo de validación futuro será:
+El archivo de validación vigente es:
 
 `database/validation-v0.5-db-4.sql`
 
-Este archivo todavía no se crea en este micro-hito. Deberá crearse después de `database/schema-v0.5-db-4.sql`.
+Fue ejecutado exitosamente contra `database/schema-v0.5-db-4.sql` en PostgreSQL 17.11. Terminó en `ROLLBACK` y los fixtures no persistieron.
 
-La validación db-4 deberá cubrir como mínimo:
+Veredicto:
+
+- `VALIDATION DB-4 PASS`.
+
+La validación db-4 confirmó:
 
 - schema ejecuta correctamente;
-- FKs simples y compuestas;
+- columnas exactas de `replenishment_allocation_fulfillments`;
+- ausencia de columnas extra en detail: `public_id`, `updated_at`, `product_id`, `purchase_id`, `purchase_order_id`, `branch_id`, `channel`, `actor_user_id`;
+- `purchase_item_id` ausente de `replenishment_allocations`;
+- FKs simples y compuestas enabled/validated;
+- ninguna FK detail usa `ON DELETE CASCADE`;
 - UNIQUE `(replenishment_allocation_id, purchase_item_id)`;
 - CHECK `fulfilled_qty_base > 0`;
+- índice detail/purchase_item vigente;
+- ausencia del índice viejo `ix_replenishment_allocations_purchase_item`;
+- ausencia de triggers `touch_updated_at` o append-only sobre detail;
+- múltiples `purchase_items` para el mismo `purchase_order_item`;
 - caso válido many-to-many;
-- caso inválido allocation/order_item A con purchase_item/order_item B;
-- caso inválido `purchase_item` no pedida con `purchase_order_item_id NULL` como source detail;
-- validaciones agregadas posibles para `SUM(detail)=fulfilled`;
-- validaciones de límite REPLENISHMENT-FIRST que puedan expresarse en fixtures.
+- `1 purchase_item -> múltiples allocations`;
+- `1 allocation -> múltiples purchase_items`;
+- `SUM(detail)=fulfilled` en fixtures coherentes;
+- `SUM(detail)<=received` por `purchase_item` en fixtures coherentes;
+- `fulfilled_qty_base = 0` rechazado;
+- `fulfilled_qty_base < 0` rechazado;
+- pareja detail duplicada rechazada;
+- cross-order-item variante 1 rechazada;
+- cross-order-item variante 2 rechazada;
+- `purchase_item` no pedida con `purchase_order_item_id NULL` rechazada como source detail;
+- partial fulfillment con `fulfilled=6`, `released=4`, `reserved=10`;
+- zero fulfillment con `fulfilled=0`, `released=10` y sin detail rows;
+- representación REPLENISHMENT-FIRST: recibido 3 + 7, detail 3 + 2, excedente no incluido en fulfillment detail.
 
 ## 12. Relación con especificación maestra y transacciones
 
