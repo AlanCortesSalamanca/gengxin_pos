@@ -73,12 +73,20 @@ Este primer borrador cierra para `CONFIRM_PURCHASE v0.1`:
 - errores de validacion del `DRAFT` cerrados hasta este micro-hito;
 - estados base;
 - recuperacion historica;
-- estructura FASE A / FASE B / FASE C hasta el punto seguro definido.
+- audit `PURCHASE_CONFIRMED`;
+- estado final de `purchases`;
+- estado final de `purchase_orders`;
+- `response_body` minimo;
+- idempotencia `COMPLETED`;
+- atomicidad global y `COMMIT` final;
+- `COMMIT` outcome unknown;
+- replay `COMPLETED`;
+- estructura FASE A / FASE B / FASE C completa para el contrato conceptual v0.1.
 
-Este borrador todavia deja abiertos:
+Este borrador todavia deja abiertos antes del freeze:
 
-- audit payload;
-- atomicidad global definitiva.
+- auditoria final integral del documento;
+- freeze definitivo de `CONFIRM_PURCHASE v0.1`.
 
 Este documento no queda validado ni congelado.
 
@@ -1387,7 +1395,7 @@ Dentro de la misma FASE B deben quedar juntos:
 - update `replenishment_positions`;
 - incremento de `version` por position.
 
-Si falla cualquiera, `ROLLBACK` completo de FASE B. Este micro-hito no cierra todavia inventario ni `COMMIT` final global.
+Si falla cualquiera, `ROLLBACK` completo de FASE B. Estos efectos forman parte de la misma FASE B cuyo cierre global y `COMMIT` definitivo se documentan en la seccion final del contrato.
 
 Replay `COMPLETED` o reconciliacion historica no recrea movements, no vuelve a modificar positions y no vuelve a terminalizar allocations. Solo reconoce efectos ya commiteados; no duplica `PURCHASE_FULFILL` ni `ORDER_RELEASE`. No se agrega nueva identidad fisica para estos efectos.
 
@@ -1691,7 +1699,7 @@ No usarlo para:
 - unique violation provocada por carrera tecnica;
 - fallos tecnicos de infraestructura.
 
-Los ultimos son fallos tecnicos/retryables segun el contrato global futuro y no deben convertirse artificialmente en `FAILED` deterministico.
+Los ultimos son fallos tecnicos/retryables segun el contrato global cerrado en este documento y no deben convertirse artificialmente en `FAILED` deterministico.
 
 Si `PURCHASE_INVENTORY_INCONSISTENT` ocurre como inconsistencia deterministica real:
 
@@ -1710,7 +1718,7 @@ Dentro de la misma FASE B deben quedar juntos:
 - sus `balance_after_base`;
 - los efectos de replenishment ya cerrados en micro-hitos anteriores.
 
-Si falla cualquiera, `ROLLBACK` completo de FASE B. Este micro-hito no cierra todavia el `COMMIT` global final.
+Si falla cualquiera, `ROLLBACK` completo de FASE B. Este bloque participa en la misma atomicidad global y `COMMIT` final definidos mas adelante en este contrato.
 
 Los efectos de inventory y replenishment conviven en la misma FASE B. Antes de las mutaciones deben estar adquiridos todos los locks necesarios segun el orden global cerrado en este contrato. Este documento cierra tambien el isolation level y la barrera de reread/recompute autoritativo previa a la materializacion.
 
@@ -2157,7 +2165,7 @@ No agregar locks por costumbre sobre:
 - `replenishment_allocation_fulfillments`: `INSERT` + UNIQUE/FKs bajo locks de allocation/position.
 - `inventory_movements`: append-only `INSERT`.
 - `replenishment_movements`: append-only `INSERT`.
-- `audit_log`: futuro append-only `INSERT`.
+- `audit_log`: append-only `INSERT` del evento final; no requiere pre-lock propio.
 - `document_sequences`: no participa en `CONFIRM_PURCHASE`.
 
 #### Fallos tecnicos vs dominio
@@ -2391,7 +2399,7 @@ Debe hacer rollback y devolver error deterministico. El usuario/flujo de edicion
 
 ## 20. Catalogo de errores cerrado hasta este micro-hito
 
-Este borrador define los errores cerrados hasta este micro-hito. El catalogo final sigue incompleto solo en lo que dependa de audit, estados finales, idempotencia `COMPLETED` y atomicidad global final.
+Este borrador define los errores cerrados hasta este micro-hito. Audit, estados finales, idempotencia `COMPLETED` y atomicidad global ya no son dependencias abiertas del catalogo de errores.
 
 Idempotencia:
 
@@ -2546,7 +2554,7 @@ Este documento no redisena `CANCEL_ORDER`.
 | `DRAFT` | `DRAFT` / `CANCELLED` / `CLOSED` | `PURCHASE_ORDER_STATUS_INVALID`. |
 | `CONFIRMED` | distinto de `CLOSED` | Estado inconsistente; no ejecutar efectos y no fingir exito. |
 
-No crear todavia un error publico adicional solo para corrupcion/integridad interna. El nombre final de un eventual error de integridad puede cerrarse despues si realmente se necesita.
+Para `CONFIRM_PURCHASE v0.1`, no crear un error publico adicional para corrupcion/integridad interna. Estos estados se tratan como inconsistencia interna / diagnostico; el contrato v0.1 no define un codigo publico especifico adicional. Esto no queda pendiente antes del freeze. Cualquier codigo publico futuro seria una evolucion posterior del contrato, no un gap de v0.1.
 
 ## 25. Result entity y response_body
 
@@ -2559,20 +2567,37 @@ No usar `purchase_orders` como resultado principal.
 
 `response_body` debe ser minimo y deliberadamente pequeno. Se conserva el limite conceptual de 16 KiB usado en contratos anteriores.
 
-Conceptualmente puede contener o permitir reconstruir:
+Estructura final recomendada para replay interno:
 
-- purchase id;
-- `public_id`;
-- `folio`;
-- `status`;
-- `confirmed_at`;
-- `purchase_order_id`;
-- order status;
-- `subtotal`;
-- `tax_total`;
-- `total`.
+```json
+{
+  "purchase_id": 0,
+  "purchase_public_id": "...",
+  "purchase_order_id": 0,
+  "folio": "...",
+  "purchase_status": "CONFIRMED",
+  "purchase_order_status": "CLOSED",
+  "confirmed_at": "...",
+  "subtotal": "...",
+  "tax_total": "...",
+  "total": "..."
+}
+```
 
-No se congela DTO/API.
+Es respuesta interna persistida para replay, no DTO/API publico congelado.
+
+No guardar en `response_body`:
+
+- `purchase_items` completos;
+- `inventory_movements`;
+- `replenishment_movements`;
+- `replenishment_allocation_fulfillments`;
+- audit completo;
+- snapshots enormes;
+- secretos;
+- payloads completos innecesarios.
+
+Si despues se requiere informacion adicional, reconstruirla desde `result_entity_type='purchases'`, `result_entity_id` y el estado persistido.
 
 ## 26. Misma key / hash diferente
 
@@ -2594,7 +2619,7 @@ Si existe:
 - mismo hash;
 - `status = 'COMPLETED'`;
 
-devolver o reconstruir el resultado historico.
+devolver `response_body` persistido o reconstruir minimamente desde `result_entity_type='purchases'` y `result_entity_id` si corresponde.
 
 No:
 
@@ -2613,7 +2638,9 @@ No:
 - recrear `PURCHASE_RECEIPT`;
 - insertar balances nuevamente;
 - repetir fulfillment;
-- repetir audit.
+- repetir cierre del `purchase_order`;
+- repetir audit;
+- repetir ningun efecto.
 
 ## 28. Misma key FAILED
 
@@ -2739,9 +2766,9 @@ FASE A no produce efectos de negocio:
 - no cambio de `purchases`;
 - no cambio de `purchase_orders`.
 
-## 34. FASE B - Estructura actual
+## 34. FASE B - Confirmacion transaccional completa
 
-FASE B aun no esta completa en este borrador porque faltan audit, estados finales, idempotencia `COMPLETED` y `COMMIT` global. Queda cerrada la estructura de concurrencia: discovery, lock acquisition y authoritative recompute + materialization.
+FASE B es la transaccion operativa completa de `CONFIRM_PURCHASE v0.1`. Incluye discovery no autoritativo, adquisicion de locks, authoritative reread/recompute, materializacion de inventario y reposicion, reconciliaciones finales, estados finales, audit, idempotencia `COMPLETED` y `COMMIT` global.
 
 ### 34.1 DISCOVERY no autoritativo
 
@@ -2781,65 +2808,317 @@ No invertir `replenishment_positions -> inventory_balances`.
 
 Bajo los locks anteriores:
 
-1. Revalidar `purchase_order_id`, `branch_id`, `supplier_id` y `replenishment_channel` contra el pre-read.
-2. Validar tenant/business visible.
-3. Validar branch: `branches.active` y pertenencia a `business_id` autenticado segun la frontera segura definida.
-4. Validar `users.status = 'ACTIVE'`.
-5. Validar acceso a `purchases.branch_id` mediante `user_branches`.
-6. Validar permiso funcional `PURCHASES_CONFIRM` mediante `user_roles -> roles -> role_permissions -> permissions`.
-7. Resolver estados/reconciliacion historica si corresponde.
-8. Si camino normal: `purchase DRAFT + order CONFIRMED`.
-9. Validar `SUPPLIER_BUSINESS_MISMATCH` si el supplier no pertenece al business de la branch.
-10. Validar `PRODUCT_BUSINESS_MISMATCH` si alguna linea referencia producto de otro business.
-11. Recalcular purchase fingerprint autoritativo desde `purchases` y `purchase_items` re-leidos bajo locks.
-12. Comparar contra `expected_purchase_fingerprint`.
-13. Aplicar politica historica de supplier/product/unit: inactividad posterior no bloquea recepcion; multiempresa si bloquea.
-14. Validar relacion producto/order-item: si hay `purchase_order_item_id`, el producto debe corresponder a esa linea; productos equivocados se representan con linea original faltante y linea no pedida.
-15. Validar consistencia quantity/factor: `received_qty`, `factor_to_base_snapshot` y `received_qty_base` coherentes segun `ROUND(received_qty * factor_to_base_snapshot, 4)`.
-16. Para cada `purchase_order_item` del pedido origen, obtener todas sus `purchase_items` asociadas, calcular `total_received_base = COALESCE(SUM(received_qty_base), 0)` y comparar contra `purchase_order_items.ordered_qty_base` sin asumir 1:1 ni omitir order items sin linea recibida.
-17. Validar `difference_reason` para lineas no pedidas, diferencias agregadas contra pedido cuando existen lineas asociadas y lineas explicitas con recibido cero.
-18. Validar `actual_unit_cost_base` como costo real persistido no negativo, sin sustituirlo por pedido, catalogo, proveedor ni costo promedio.
-19. Validar subtotal de linea con `ROUND(received_qty_base * actual_unit_cost_base, 2)`.
-20. Validar `tax_snapshot` v1 segun `docs/domain/tax-snapshot-v1.md`.
-21. Validar `tax_total` contra `tax_snapshot` v1.
-22. Validar relaciones de total de linea: `purchase_items.total = purchase_items.subtotal + purchase_items.tax_total`.
-23. Validar sumas/totales de header: subtotal, `tax_total`, total por suma de lineas y `total = subtotal + tax_total`; si no hay lineas, todos deben ser cero.
-24. Releer/recalcular datos de devoluciones `RESTOCK` confirmadas necesarias para `current_sale_item_demand`.
-25. Releer `replenishment_allocations` actuales y allocations externas previas necesarias.
-26. Recalcular recepcion aplicable con REPLENISHMENT-FIRST: `received_applicable_to_replenishment_base` por `purchase_order_item`.
-27. Recalcular precedence externa historica por `purchase_orders.confirmed_at ASC`, `purchase_orders.id ASC`, `purchase_order_items.line_number ASC`, `purchase_order_items.id ASC`, `replenishment_allocations.id ASC`.
-28. Recorrer `purchase_order_items` del pedido actual por `line_number ASC, id ASC`.
-29. Dentro de cada order item, recorrer allocations destino por FIFO funcional de demanda: `sales.confirmed_at ASC`, `sales.id ASC`, `sale_items.line_number ASC`, `sale_items.id ASC`, `replenishment_allocations.id ASC`.
-30. Recalcular `current_sale_item_demand`, `fulfilled_prior`, `external_prior_active_reserved`, `receipt_cap`, `max_future_fulfill` y `safe_fulfill_now`.
-31. Si cualquier allocation produce `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, abortar FASE B completa sin efectos ni fulfillment/detail persistido.
-32. Si es SAFE, registrar `planned_fulfill_delta = safe_fulfill_now` y consumir `planned_remaining_received_applicable`; nunca puede ser negativo y, si llega a `0`, las allocations posteriores reciben `receipt_cap = 0`.
-33. Solo cuando toda la compra tenga plan SAFE, construir capacidades source REPLENISHMENT-FIRST por `purchase_order_item` recorriendo `purchase_items` en source FIFO `line_number ASC, id ASC`.
-34. Consumir source capacities acumulativamente contra allocations destino para producir `detail_delta`, sin reiniciar capacidad por allocation.
-35. Para cada allocation, calcular `planned_release_delta = remaining_reserved - planned_fulfill_delta`.
-36. Validar terminalizacion: `planned_fulfill_delta + planned_release_delta = remaining_reserved` y, al aplicar, `new_fulfilled_qty_base + new_released_qty_base = reserved_qty_base`.
-37. Planear `PURCHASE_FULFILL` para cada `planned_fulfill_delta > 0` y `ORDER_RELEASE` para cada `planned_release_delta > 0`, ambos referenciando `replenishment_allocations.id`.
-38. Agrupar `planned_fulfill_delta` y `planned_release_delta` por `branch_id`, `product_id`, `channel`.
-39. Validar que cada `replenishment_positions` esperada existe, coincide exactamente con las keys de sus allocations y que aplicar los deltas no produce negativos.
-40. Releer `inventory_balances.quantity_base`, `average_cost_base` y `version` bloqueados.
-41. Agrupar inventory receipt por `(branch_id, product_id)` y calcular `received_qty_total` y `received_value_total` con `NUMERIC` exacto.
-42. Para cada balance afectado, calcular `new_quantity_base` y `new_average_cost_base` desde el saldo autoritativo bloqueado.
-43. Para balances realmente nuevos con `received_qty_total > 0`, conservar `version = 0` por default db-4; para balances existentes, planear `version = version + 1` exactamente una vez por `(branch_id, product_id)`.
-44. Planear un `PURCHASE_RECEIPT` por cada `purchase_item` positiva, con `unit_cost_base = actual_unit_cost_base`, referencia a `purchase_items.id` y `balance_after_base` deterministico por producto ordenando `purchase_items.line_number ASC, id ASC`.
-45. Verificar plan de inventario: movements equivalen a `received_qty_base`, ultimo `balance_after_base` por producto coincide con `new quantity_base`, costo promedio usa el calculo canonico y no hay efecto para lineas con cantidad cero.
-46. Materializar en la misma FASE B los efectos de replenishment ya cerrados: detail, allocation fulfillment/release, `PURCHASE_FULFILL`, `ORDER_RELEASE`, `replenishment_positions` agregadas y `version` de positions.
-47. Materializar en la misma FASE B los efectos de inventario cerrados: crear o actualizar `inventory_balances`, recalcular `average_cost_base`, incrementar `version` solo en UPDATE e insertar todos los `PURCHASE_RECEIPT` con `balance_after_base`.
-48. Verificar reconciliacion de reposicion: `SUM(new detail rows)=planned_fulfill_delta`, `SUM(all historical detail rows)=new_allocation_fulfilled_qty_base`, movements equivalen a los deltas agregados y cada position refleja exactamente esos deltas.
-49. Verificar reconciliacion de inventario: movements equivalen a cantidades recibidas positivas, unit costs coinciden con `actual_unit_cost_base`, balances reflejan los deltas agregados y el promedio ponderado persistido coincide con el calculo canonico.
-50. Si `planned_fulfill_delta = 0`, no insertar detail rows ni `PURCHASE_FULFILL` para esa allocation; si `planned_release_delta = 0`, no insertar `ORDER_RELEASE` para esa allocation; si `received_qty_base = 0`, no insertar `PURCHASE_RECEIPT` ni tocar balance por esa linea.
-51. Continuar hacia audit, estados finales, idempotencia `COMPLETED` y atomicidad global, que siguen pendientes.
+1. Capturar un unico timestamp operativo de negocio: `confirmed_at`.
+2. Revalidar `purchase_order_id`, `branch_id`, `supplier_id` y `replenishment_channel` contra el pre-read.
+3. Validar tenant/business visible.
+4. Validar branch: `branches.active` y pertenencia a `business_id` autenticado segun la frontera segura definida.
+5. Validar `users.status = 'ACTIVE'`.
+6. Validar acceso a `purchases.branch_id` mediante `user_branches`.
+7. Validar permiso funcional `PURCHASES_CONFIRM` mediante `user_roles -> roles -> role_permissions -> permissions`.
+8. Resolver estados/reconciliacion historica si corresponde.
+9. Si camino normal: `purchase DRAFT + order CONFIRMED`.
+10. Validar `SUPPLIER_BUSINESS_MISMATCH` si el supplier no pertenece al business de la branch.
+11. Validar `PRODUCT_BUSINESS_MISMATCH` si alguna linea referencia producto de otro business.
+12. Recalcular purchase fingerprint autoritativo desde `purchases` y `purchase_items` re-leidos bajo locks.
+13. Comparar contra `expected_purchase_fingerprint`.
+14. Aplicar politica historica de supplier/product/unit: inactividad posterior no bloquea recepcion; multiempresa si bloquea.
+15. Validar relacion producto/order-item: si hay `purchase_order_item_id`, el producto debe corresponder a esa linea; productos equivocados se representan con linea original faltante y linea no pedida.
+16. Validar consistencia quantity/factor: `received_qty`, `factor_to_base_snapshot` y `received_qty_base` coherentes segun `ROUND(received_qty * factor_to_base_snapshot, 4)`.
+17. Para cada `purchase_order_item` del pedido origen, obtener todas sus `purchase_items` asociadas, calcular `total_received_base = COALESCE(SUM(received_qty_base), 0)` y comparar contra `purchase_order_items.ordered_qty_base` sin asumir 1:1 ni omitir order items sin linea recibida.
+18. Validar `difference_reason` para lineas no pedidas, diferencias agregadas contra pedido cuando existen lineas asociadas y lineas explicitas con recibido cero.
+19. Validar `actual_unit_cost_base` como costo real persistido no negativo, sin sustituirlo por pedido, catalogo, proveedor ni costo promedio.
+20. Validar subtotal de linea con `ROUND(received_qty_base * actual_unit_cost_base, 2)`.
+21. Validar `tax_snapshot` v1 segun `docs/domain/tax-snapshot-v1.md`.
+22. Validar `tax_total` contra `tax_snapshot` v1.
+23. Validar relaciones de total de linea: `purchase_items.total = purchase_items.subtotal + purchase_items.tax_total`.
+24. Validar sumas/totales de header: subtotal, `tax_total`, total por suma de lineas y `total = subtotal + tax_total`; si no hay lineas, todos deben ser cero.
+25. Releer/recalcular datos de devoluciones `RESTOCK` confirmadas necesarias para `current_sale_item_demand`.
+26. Releer `replenishment_allocations` actuales y allocations externas previas necesarias.
+27. Recalcular recepcion aplicable con REPLENISHMENT-FIRST: `received_applicable_to_replenishment_base` por `purchase_order_item`.
+28. Recalcular precedence externa historica por `purchase_orders.confirmed_at ASC`, `purchase_orders.id ASC`, `purchase_order_items.line_number ASC`, `purchase_order_items.id ASC`, `replenishment_allocations.id ASC`.
+29. Recorrer `purchase_order_items` del pedido actual por `line_number ASC, id ASC`.
+30. Dentro de cada order item, recorrer allocations destino por FIFO funcional de demanda: `sales.confirmed_at ASC`, `sales.id ASC`, `sale_items.line_number ASC`, `sale_items.id ASC`, `replenishment_allocations.id ASC`.
+31. Recalcular `current_sale_item_demand`, `fulfilled_prior`, `external_prior_active_reserved`, `receipt_cap`, `max_future_fulfill` y `safe_fulfill_now`.
+32. Si cualquier allocation produce `PURCHASE_REPLENISHMENT_PREDECESSOR_PENDING`, abortar FASE B completa sin efectos ni fulfillment/detail persistido.
+33. Si es SAFE, registrar `planned_fulfill_delta = safe_fulfill_now` y consumir `planned_remaining_received_applicable`; nunca puede ser negativo y, si llega a `0`, las allocations posteriores reciben `receipt_cap = 0`.
+34. Solo cuando toda la compra tenga plan SAFE, construir capacidades source REPLENISHMENT-FIRST por `purchase_order_item` recorriendo `purchase_items` en source FIFO `line_number ASC, id ASC`.
+35. Consumir source capacities acumulativamente contra allocations destino para producir `detail_delta`, sin reiniciar capacidad por allocation.
+36. Para cada allocation, calcular `planned_release_delta = remaining_reserved - planned_fulfill_delta`.
+37. Validar terminalizacion: `planned_fulfill_delta + planned_release_delta = remaining_reserved` y, al aplicar, `new_fulfilled_qty_base + new_released_qty_base = reserved_qty_base`.
+38. Planear `PURCHASE_FULFILL` para cada `planned_fulfill_delta > 0` y `ORDER_RELEASE` para cada `planned_release_delta > 0`, ambos referenciando `replenishment_allocations.id`.
+39. Agrupar `planned_fulfill_delta` y `planned_release_delta` por `branch_id`, `product_id`, `channel`.
+40. Validar que cada `replenishment_positions` esperada existe, coincide exactamente con las keys de sus allocations y que aplicar los deltas no produce negativos.
+41. Releer `inventory_balances.quantity_base`, `average_cost_base` y `version` bloqueados.
+42. Agrupar inventory receipt por `(branch_id, product_id)` y calcular `received_qty_total` y `received_value_total` con `NUMERIC` exacto.
+43. Para cada balance afectado, calcular `new_quantity_base` y `new_average_cost_base` desde el saldo autoritativo bloqueado.
+44. Para balances realmente nuevos con `received_qty_total > 0`, conservar `version = 0` por default db-4; para balances existentes, planear `version = version + 1` exactamente una vez por `(branch_id, product_id)`.
+45. Planear un `PURCHASE_RECEIPT` por cada `purchase_item` positiva, con `unit_cost_base = actual_unit_cost_base`, referencia a `purchase_items.id` y `balance_after_base` deterministico por producto ordenando `purchase_items.line_number ASC, id ASC`.
+46. Verificar plan de inventario: movements equivalen a `received_qty_base`, ultimo `balance_after_base` por producto coincide con `new quantity_base`, costo promedio usa el calculo canonico y no hay efecto para lineas con cantidad cero.
+47. Materializar en la misma FASE B los efectos de replenishment ya cerrados: detail, allocation fulfillment/release, `PURCHASE_FULFILL`, `ORDER_RELEASE`, `replenishment_positions` agregadas y `version` de positions.
+48. Materializar en la misma FASE B los efectos de inventario cerrados: crear o actualizar `inventory_balances`, recalcular `average_cost_base`, incrementar `version` solo en UPDATE e insertar todos los `PURCHASE_RECEIPT` con `balance_after_base`.
+49. Verificar reconciliacion de reposicion: `SUM(new detail rows)=planned_fulfill_delta`, `SUM(all historical detail rows)=new_allocation_fulfilled_qty_base`, movements equivalen a los deltas agregados y cada position refleja exactamente esos deltas.
+50. Verificar reconciliacion de inventario: movements equivalen a cantidades recibidas positivas, unit costs coinciden con `actual_unit_cost_base`, balances reflejan los deltas agregados y el promedio ponderado persistido coincide con el calculo canonico.
+51. Si `planned_fulfill_delta = 0`, no insertar detail rows ni `PURCHASE_FULFILL` para esa allocation; si `planned_release_delta = 0`, no insertar `ORDER_RELEASE` para esa allocation; si `received_qty_base = 0`, no insertar `PURCHASE_RECEIPT` ni tocar balance por esa linea.
+52. Actualizar `purchases`: `status='CONFIRMED'`, `confirmed_by_user_id=actor autorizado`, `confirmed_at=confirmed_at` operativo.
+53. Actualizar `purchase_orders`: `status='CLOSED'`, `closed_at=confirmed_at` operativo; no modificar `purchase_orders.confirmed_at` ni `purchase_orders.confirmed_by_user_id`.
+54. Construir `response_body` minimo desde el estado final.
+55. Insertar un unico `audit_log` con `action='PURCHASE_CONFIRMED'` y `occurred_at=confirmed_at`.
+56. Actualizar `idempotency_keys` a `COMPLETED` con `result_entity_type='purchases'`, `result_entity_id=purchases.id`, `response_body` minimo, errores `NULL`, `locked_until=NULL` y `expires_at=now()+30 dias`.
+57. Hacer `COMMIT` global de FASE B.
 
 No se producen efectos antes de completar validaciones del `DRAFT`, adquirir locks globales, superar SAFE autoritativo y validar la consistencia de reposicion e inventario.
 
 La consistencia supplier/product business puede validarse antes del fingerprint porque protege tenant/integridad. La semantica fiscal completa de `tax_snapshot` v1 queda definida por `docs/domain/tax-snapshot-v1.md` y se valida antes de efectos.
 
+### 34.4 Timestamp operativo unico
+
+Dentro de FASE B se captura una sola marca temporal de negocio:
+
+```text
+confirmed_at
+```
+
+Ese valor debe reutilizarse para:
+
+- `purchases.confirmed_at`;
+- `purchase_orders.closed_at`;
+- `audit_log.occurred_at`;
+- `audit_log.after_data.confirmed_at`;
+- `audit_log.after_data.purchase_order_closed_at`;
+- `response_body.confirmed_at`.
+
+No modificar `purchase_orders.confirmed_at`, porque pertenece historicamente a `CONFIRM_ORDER`.
+
+Los `created_at` / `updated_at` tecnicos de otras tablas no sustituyen este timestamp de negocio.
+
+### 34.5 Estado final de purchase
+
+Camino normal exitoso:
+
+```text
+purchases.status: DRAFT -> CONFIRMED
+```
+
+Escrituras finales:
+
+- `status = 'CONFIRMED'`;
+- `confirmed_by_user_id = actor autorizado`;
+- `confirmed_at = confirmed_at operativo`.
+
+Esta transicion ocurre solo despues de authoritative reread/recompute, validaciones, materializacion de inventario, materializacion de reposicion, reconciliacion final de inventario y reconciliacion final de reposicion.
+
+No confirmar la `purchase` si cualquier etapa anterior falla.
+
+### 34.6 Estado final de purchase_order
+
+Camino normal exitoso:
+
+```text
+purchase_orders.status: CONFIRMED -> CLOSED
+```
+
+Escritura final:
+
+- `status = 'CLOSED'`;
+- `closed_at = confirmed_at operativo`.
+
+No modificar:
+
+- `purchase_orders.confirmed_at`;
+- `purchase_orders.confirmed_by_user_id`.
+
+Esos campos pertenecen a la confirmacion historica del pedido por `CONFIRM_ORDER`.
+
+Policy A y `UNIQUE(purchase_order_id)` en `purchases` implican una sola recepcion operativa para el pedido. Por tanto, al confirmar exitosamente la compra, el `purchase_order` debe quedar `CLOSED`.
+
+No introducir:
+
+- `PARTIAL`;
+- segunda recepcion;
+- recepcion pendiente;
+- db-5.
+
+### 34.7 Audit PURCHASE_CONFIRMED
+
+El camino normal exitoso inserta un solo audit de confirmacion.
+
+Columnas estructurales:
+
+- `actor_user_id = actor autorizado`;
+- `branch_id = purchases.branch_id`;
+- `terminal_id = terminal contextual si existe; NULL si no aplica`;
+- `action = 'PURCHASE_CONFIRMED'`;
+- `entity_type = 'purchases'`;
+- `entity_id = purchases.id`;
+- `entity_public_id = purchases.public_id`;
+- `before_data`;
+- `after_data`;
+- `context`;
+- `ip_address`;
+- `user_agent`;
+- `occurred_at = confirmed_at`.
+
+`before_data` minimo:
+
+```json
+{
+  "purchase_status": "DRAFT",
+  "purchase_order_status": "CONFIRMED"
+}
+```
+
+`after_data` minimo:
+
+```json
+{
+  "purchase_status": "CONFIRMED",
+  "purchase_order_status": "CLOSED",
+  "confirmed_at": "...",
+  "purchase_order_closed_at": "...",
+  "subtotal": "...",
+  "tax_total": "...",
+  "total": "...",
+  "inventory_receipt_count": 0,
+  "inventory_product_count": 0,
+  "purchase_fulfill_count": 0,
+  "order_release_count": 0,
+  "allocations_terminalized_count": 0
+}
+```
+
+`context` minimo:
+
+```json
+{
+  "operation_type": "CONFIRM_PURCHASE",
+  "flow_version": "v0.1",
+  "business_id": 0,
+  "expected_purchase_fingerprint": "...",
+  "authoritative_purchase_fingerprint": "...",
+  "client_operation_id": "..."
+}
+```
+
+`client_operation_id` solo se incluye si existe.
+
+No guardar cantidades globales como:
+
+- `inventory_received_qty_base_total`;
+- `replenishment_fulfilled_qty_base_total`;
+- `replenishment_released_qty_base_total`.
+
+`quantity_base` pertenece a la unidad base de cada producto. Distintos productos pueden tener unidades base distintas, por lo que sumarlas globalmente no es dimensionalmente valido.
+
+Las cantidades autoritativas permanecen en:
+
+- `inventory_movements`;
+- `replenishment_movements`;
+- `replenishment_allocations`;
+- `replenishment_allocation_fulfillments`.
+
+No guardar en audit:
+
+- `idempotency_key` completa;
+- `idempotency_key_ref` inventado;
+- hash/truncado nuevo de la key;
+- request completo;
+- SQL;
+- stack traces;
+- secretos.
+
+La identidad idempotente vive autoritativamente en `idempotency_keys`.
+
+### 34.8 Idempotency COMPLETED
+
+En el camino normal exitoso, dentro de la misma FASE B y antes del `COMMIT`, actualizar la fila `idempotency_keys` ya bloqueada:
+
+- `status = 'COMPLETED'`;
+- `result_entity_type = 'purchases'`;
+- `result_entity_id = purchases.id`;
+- `response_body = response minimo definido`;
+- `error_code = NULL`;
+- `error_message = NULL`;
+- `locked_until = NULL`;
+- `expires_at = now() + 30 dias`.
+
+La compra `CONFIRMED` y la key `COMPLETED` son atomicas. Para la misma ejecucion/key bajo este contrato, si FASE B committeo, idempotencia `COMPLETED` tambien committeo.
+
+No describir como estado normal posible:
+
+```text
+purchase CONFIRMED
++ order CLOSED
++ misma key IN_PROGRESS
+```
+
+### 34.9 Orden final de escrituras
+
+Despues de completar authoritative recompute, validaciones, materializacion y reconciliacion:
+
+1. Materializar inventory y replenishment ya cerrados.
+2. Verificar reconciliaciones finales.
+3. Actualizar `purchases -> CONFIRMED`.
+4. Actualizar `purchase_orders -> CLOSED`.
+5. Construir `response_body` minimo desde el estado final.
+6. Insertar `audit_log PURCHASE_CONFIRMED`.
+7. Actualizar `idempotency_keys -> COMPLETED` con `response_body`.
+8. `COMMIT`.
+
+Todo ocurre dentro de la misma FASE B transaccional. No introducir commits intermedios.
+
+### 34.10 Atomicidad global
+
+Frontera conceptual:
+
+```text
+BEGIN FASE B
+
+locks
+authoritative reread
+validaciones
+SAFE
+inventory
+replenishment
+reconciliaciones
+purchase CONFIRMED
+order CLOSED
+audit
+idempotency COMPLETED
+
+COMMIT
+```
+
+Si falla cualquier paso antes del `COMMIT`, hacer `ROLLBACK` completo de FASE B.
+
+No puede persistir aisladamente:
+
+- inventory;
+- replenishment;
+- `purchase CONFIRMED`;
+- `order CLOSED`;
+- audit;
+- idempotency `COMPLETED`.
+
+### 34.11 COMMIT outcome unknown
+
+Si ocurre perdida de conexion, crash, timeout interno o incertidumbre tecnica al final de FASE B, no inventar un marcador fisico adicional.
+
+Caso A: el `COMMIT` si ocurrio. Deben estar committed juntos:
+
+- `purchase CONFIRMED`;
+- `order CLOSED`;
+- audit `PURCHASE_CONFIRMED`;
+- idempotency `COMPLETED`.
+
+Un retry con la misma key/hash observa `COMPLETED` y hace replay.
+
+Caso B: el `COMMIT` no ocurrio. FASE B no dejo efectos persistidos. La key creada en FASE A puede seguir `IN_PROGRESS` hasta recovery/lease; la `purchase` permanece `DRAFT`, el `purchase_order` permanece `CONFIRMED` y un retry recuperable puede reejecutar normalmente.
+
 ## 35. Reconciliacion historica
 
-Para una nueva key o `IN_PROGRESS` recuperable, si despues de validar scope/autorizacion actual se encuentra:
+Este camino es distinto de la ejecucion normal. No representa una ejecucion parcial donde la misma key haya dejado `purchase CONFIRMED + order CLOSED + IN_PROGRESS`; bajo el camino normal actual, esos cambios y `idempotency COMPLETED` commitean juntos.
+
+Para una nueva key o `IN_PROGRESS` recuperable, si despues de validar scope/autorizacion actual se encuentra un estado historico ya completo:
 
 ```text
 purchase.status = 'CONFIRMED'
@@ -2851,17 +3130,22 @@ AND purchase_order.closed_at IS NOT NULL
 
 entonces:
 
-- no repetir efectos;
+- no repetir inventory;
+- no repetir replenishment;
+- no cerrar el order otra vez;
+- no crear audit nuevo;
 - reconciliar la key actual hacia `COMPLETED`;
 - `result_entity_type = 'purchases'`;
 - `result_entity_id = purchases.id`;
-- guardar respuesta minima;
+- guardar o reconstruir `response_body` minimo;
+- `error_code = NULL`;
+- `error_message = NULL`;
 - `locked_until = NULL`;
 - `expires_at = now() + 30 dias`.
 
-No crear otro audit de confirmacion.
-
 No modificar inventario/reposicion. En particular, no reinsertar `replenishment_allocation_fulfillments`, no recrear `PURCHASE_FULFILL`, no recrear `ORDER_RELEASE`, no volver a actualizar `replenishment_positions`, no volver a terminalizar `replenishment_allocations`, no incrementar `inventory_balances`, no recalcular `average_cost_base`, no incrementar `inventory_balances.version`, no reinsertar `PURCHASE_RECEIPT` y no volver a crear balances.
+
+Puede existir mas de una `idempotency_key` `COMPLETED` apuntando a la misma `purchase` por reconciliacion historica. Eso no significa doble recepcion ni doble confirmacion.
 
 ## 36. Estado inconsistente
 
@@ -2870,13 +3154,16 @@ No considerar exito historico si falta coherencia entre `purchase CONFIRMED` y `
 Ejemplos:
 
 - `purchase CONFIRMED + order CONFIRMED`;
-- `purchase DRAFT + order CLOSED`.
+- `purchase DRAFT + order CLOSED`;
+- `purchase CONFIRMED` sin `confirmed_at`;
+- `purchase CONFIRMED` sin `confirmed_by_user_id`;
+- `order CLOSED` sin `closed_at`.
 
 No ejecutar efectos para arreglar silenciosamente el estado.
 
 No inventar historia.
 
-Documentar como inconsistencia que requiere rechazo/diagnostico. El catalogo definitivo de error de integridad puede decidirse en un micro-hito posterior.
+Documentar como inconsistencia interna / diagnostico que requiere rechazo seguro. `CONFIRM_PURCHASE v0.1` no crea ahora un error publico especifico adicional para corrupcion/integridad interna. Esto no queda pendiente antes del freeze; cualquier codigo publico futuro seria una evolucion posterior del contrato, no un gap de v0.1.
 
 ## 37. FASE C - Error deterministico
 
@@ -3049,7 +3336,7 @@ Este micro-hito no requiere cambio fisico adicional sobre db-4:
 
 No agregar `CHECKs` adicionales solo porque estas reglas se validen en servicio.
 
-El bloque de inventory receipt y weighted average cost queda cubierto por estructuras ya existentes en db-4:
+Los bloques de inventory receipt, weighted average cost, audit, estados finales e idempotencia quedan cubiertos por estructuras ya existentes en db-4:
 
 - `inventory_balances(branch_id, product_id)`;
 - `quantity_base`;
@@ -3061,9 +3348,19 @@ El bloque de inventory receipt y weighted average cost queda cubierto por estruc
 - `balance_after_base`;
 - `reference_entity_type`;
 - `reference_entity_id`;
-- `actor_user_id`.
+- `actor_user_id`;
+- `purchases.status`;
+- `purchases.confirmed_by_user_id`;
+- `purchases.confirmed_at`;
+- `purchase_orders.status`;
+- `purchase_orders.closed_at`;
+- `audit_log`;
+- `idempotency_keys.response_body`;
+- `result_entity_type`;
+- `result_entity_id`;
+- lifecycle idempotente existente.
 
-No crear db-5 por este micro-hito.
+No crear db-5 por este micro-hito. No modificar schema.
 
 El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no evolucion fisica del modelo.
 
@@ -3073,16 +3370,18 @@ El seed futuro de `PURCHASES_CONFIRM` es configuracion/implementacion futura, no
 
 Antes de congelar `CONFIRM_PURCHASE v0.1`, faltan:
 
-- audit payload final;
-- transicion final `purchases.status = 'CONFIRMED'`;
-- `confirmed_by_user_id` / `confirmed_at` finales;
-- transicion final `purchase_orders.status = 'CLOSED'`;
-- `idempotency_keys.status = 'COMPLETED'` final;
-- `response_body` final;
-- `COMMIT` global final;
-- atomicidad global completa;
-- cierre definitivo completo de `CONFIRM_PURCHASE`;
-- pruebas de concurrencia.
+- auditoria final integral del documento;
+- freeze definitivo de `CONFIRM_PURCHASE v0.1`.
+
+No son gaps conceptuales pendientes del contrato:
+
+- pruebas de concurrencia;
+- API/DTO publico;
+- servicio;
+- repositorio;
+- implementacion.
+
+Esos puntos son trabajo posterior al contrato documental.
 
 No quedan como pendientes en este borrador:
 
@@ -3094,6 +3393,20 @@ No quedan como pendientes en este borrador:
 - frontera tenant;
 - acceso de sucursal;
 - errores business cerrados en este micro-hito;
+- audit payload final;
+- timestamp operativo unico;
+- transicion final `purchases.status = 'CONFIRMED'`;
+- `confirmed_by_user_id` / `confirmed_at` finales;
+- transicion final `purchase_orders.status = 'CLOSED'`;
+- `purchase_orders.closed_at` final;
+- `idempotency_keys.status = 'COMPLETED'` final;
+- `response_body` final;
+- orden final de escrituras;
+- `COMMIT` global final;
+- atomicidad global completa;
+- `COMMIT` outcome unknown;
+- replay `COMPLETED`;
+- reconciliacion historica final;
 - supplier inactive;
 - product inactive;
 - unidad operativa/inactiva posterior;
